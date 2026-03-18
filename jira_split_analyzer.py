@@ -131,7 +131,7 @@ def collect_relationships(jira: JiraClient, project_keys: set[str]):
 
     for proj_key in sorted(project_keys):
         log.info(f"Scanning project {proj_key} ...")
-        jql = f"project = {proj_key} ORDER BY created ASC"
+        jql = f'project = "{proj_key}" ORDER BY created ASC'
 
         for issue in jira.search_issues(jql, fields):
             total_issues += 1
