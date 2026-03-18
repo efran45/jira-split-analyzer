@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.env
+jira_split_results.json

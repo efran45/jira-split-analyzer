@@ -1,0 +1,4 @@
+requests
+networkx
+python-louvain
+tabulate
