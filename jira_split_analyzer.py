@@ -98,6 +98,22 @@ class JiraClient:
 # Data collection
 # ---------------------------------------------------------------------------
 
+def _project_from_issue(issue_obj: dict) -> str | None:
+    """Extract project key from an issue object.
+
+    Handles both full objects (with fields.project.key) and minimal
+    objects (with just a 'key' like 'PROJ-123').
+    """
+    try:
+        return issue_obj["fields"]["project"]["key"]
+    except (KeyError, TypeError):
+        pass
+    issue_key = issue_obj.get("key", "")
+    if "-" in issue_key:
+        return issue_key.rsplit("-", 1)[0]
+    return None
+
+
 def collect_relationships(jira: JiraClient, project_keys: set[str]):
     """
     Scan all issues and collect cross-project relationships.
@@ -130,22 +146,22 @@ def collect_relationships(jira: JiraClient, project_keys: set[str]):
             for link in issue["fields"].get("issuelinks") or []:
                 linked_issue = link.get("outwardIssue") or link.get("inwardIssue")
                 if linked_issue:
-                    dst_proj = linked_issue["fields"]["project"]["key"]
-                    if dst_proj != src_proj and dst_proj in project_keys:
+                    dst_proj = _project_from_issue(linked_issue)
+                    if dst_proj and dst_proj != src_proj and dst_proj in project_keys:
                         key = tuple(sorted([src_proj, dst_proj]))
                         edge_weights[key] += 1
 
             # --- 2. Parent-child (epic/parent → child) ---
             parent = issue["fields"].get("parent")
             if parent:
-                dst_proj = parent["fields"]["project"]["key"]
-                if dst_proj != src_proj and dst_proj in project_keys:
+                dst_proj = _project_from_issue(parent)
+                if dst_proj and dst_proj != src_proj and dst_proj in project_keys:
                     key = tuple(sorted([src_proj, dst_proj]))
                     edge_weights[key] += 1
 
             for sub in issue["fields"].get("subtasks") or []:
-                dst_proj = sub["fields"]["project"]["key"]
-                if dst_proj != src_proj and dst_proj in project_keys:
+                dst_proj = _project_from_issue(sub)
+                if dst_proj and dst_proj != src_proj and dst_proj in project_keys:
                     key = tuple(sorted([src_proj, dst_proj]))
                     edge_weights[key] += 1
 
