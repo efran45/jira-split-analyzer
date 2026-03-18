@@ -114,33 +114,85 @@ def _project_from_issue(issue_obj: dict) -> str | None:
     return None
 
 
+CHECKPOINT_FILE = "jira_split_checkpoint.json"
+
+
+def _load_checkpoint() -> dict:
+    """Load checkpoint from disk if it exists."""
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE) as f:
+            data = json.load(f)
+        log.info(
+            f"Loaded checkpoint: {len(data.get('completed_projects', []))} projects "
+            f"already scanned ({data.get('total_issues', 0)} issues)"
+        )
+        return data
+    return {}
+
+
+def _save_checkpoint(
+    completed_projects: list[str],
+    edge_weights: dict,
+    issue_counts: dict,
+    total_issues: int,
+):
+    """Save current progress to disk."""
+    data = {
+        "completed_projects": completed_projects,
+        "edge_weights": {f"{a}|{b}": w for (a, b), w in edge_weights.items()},
+        "issue_counts": issue_counts,
+        "total_issues": total_issues,
+    }
+    with open(CHECKPOINT_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
 def collect_relationships(jira: JiraClient, project_keys: set[str]):
     """
     Scan all issues and collect cross-project relationships.
+    Saves a checkpoint after each project so it can resume if interrupted.
 
     Returns a dict: (projA, projB) -> count   (sorted tuple keys)
     """
     edge_weights = defaultdict(int)
     issue_count_by_project = defaultdict(int)
+    completed_projects = []
+
+    # Load checkpoint if available
+    checkpoint = _load_checkpoint()
+    if checkpoint:
+        completed_projects = checkpoint.get("completed_projects", [])
+        for k, w in checkpoint.get("edge_weights", {}).items():
+            a, b = k.split("|")
+            edge_weights[(a, b)] = w
+        issue_count_by_project.update(checkpoint.get("issue_counts", {}))
 
     # Build regex to detect cross-project mentions like "PROJ-123"
     mention_re = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
 
     fields = ["project", "issuelinks", "parent", "subtasks", "description"]
-    total_issues = 0
+    total_issues = checkpoint.get("total_issues", 0)
+    remaining = sorted(project_keys - set(completed_projects))
 
-    for proj_key in sorted(project_keys):
+    if remaining:
+        log.info(f"{len(remaining)} projects remaining: {', '.join(remaining)}")
+    else:
+        log.info("All projects already scanned (from checkpoint).")
+
+    for proj_key in remaining:
         log.info(f"Scanning project {proj_key} ...")
         jql = f'project = "{proj_key}" ORDER BY created ASC'
+        proj_issues = 0
 
         for issue in jira.search_issues(jql, fields):
             total_issues += 1
+            proj_issues += 1
             issue_key = issue["key"]
             src_proj = issue["fields"]["project"]["key"]
             issue_count_by_project[src_proj] += 1
 
-            if total_issues % 500 == 0:
-                log.info(f"  ... processed {total_issues} issues so far")
+            if proj_issues % 500 == 0:
+                log.info(f"  ... {proj_issues} issues in {proj_key} ({total_issues} total)")
 
             # --- 1. Issue links ---
             for link in issue["fields"].get("issuelinks") or []:
@@ -189,6 +241,11 @@ def collect_relationships(jira: JiraClient, project_keys: set[str]):
                     if dst_proj != src_proj and dst_proj in project_keys:
                         key = tuple(sorted([src_proj, dst_proj]))
                         edge_weights[key] += 1
+
+        # Save checkpoint after each project completes
+        completed_projects.append(proj_key)
+        _save_checkpoint(completed_projects, edge_weights, dict(issue_count_by_project), total_issues)
+        log.info(f"  ✓ {proj_key} done ({proj_issues} issues). Checkpoint saved.")
 
     log.info(f"Finished scanning {total_issues} issues across {len(project_keys)} projects.")
     return dict(edge_weights), dict(issue_count_by_project)
