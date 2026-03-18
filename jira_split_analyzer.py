@@ -51,6 +51,12 @@ class JiraClient:
         resp.raise_for_status()
         return resp.json()
 
+    def post(self, path: str, body: dict) -> dict:
+        url = f"{self.base_url}/rest/api/3/{path}"
+        resp = self.session.post(url, json=body)
+        resp.raise_for_status()
+        return resp.json()
+
     def get_all_projects(self) -> list[dict]:
         """Return all projects the user can see."""
         projects = []
@@ -64,14 +70,14 @@ class JiraClient:
         return projects
 
     def search_issues(self, jql: str, fields: str, max_results: int = 100):
-        """Generator that pages through JQL search results."""
+        """Generator that pages through JQL search results using POST endpoint."""
         start = 0
         while True:
-            data = self.get("search", {
+            data = self.post("search/jql", {
                 "jql": jql,
                 "startAt": start,
                 "maxResults": max_results,
-                "fields": fields,
+                "fields": [f.strip() for f in fields.split(",")],
             })
             yield from data["issues"]
             if start + max_results >= data["total"]:
