@@ -54,7 +54,9 @@ class JiraClient:
     def post(self, path: str, body: dict) -> dict:
         url = f"{self.base_url}/rest/api/3/{path}"
         resp = self.session.post(url, json=body)
-        resp.raise_for_status()
+        if not resp.ok:
+            log.error(f"POST {path} returned {resp.status_code}: {resp.text[:500]}")
+            resp.raise_for_status()
         return resp.json()
 
     def get_all_projects(self) -> list[dict]:
@@ -69,20 +71,27 @@ class JiraClient:
             start += len(data["values"])
         return projects
 
-    def search_issues(self, jql: str, fields: str, max_results: int = 100):
+    def search_issues(self, jql: str, fields: list[str], max_results: int = 100):
         """Generator that pages through JQL search results using POST endpoint."""
-        start = 0
+        next_page_token = None
         while True:
-            data = self.post("search/jql", {
+            body = {
                 "jql": jql,
-                "startAt": start,
                 "maxResults": max_results,
-                "fields": [f.strip() for f in fields.split(",")],
-            })
+                "fields": fields,
+            }
+            if next_page_token:
+                body["nextPageToken"] = next_page_token
+            data = self.post("search/jql", body)
             yield from data["issues"]
-            if start + max_results >= data["total"]:
+            next_page_token = data.get("nextPageToken")
+            if not next_page_token:
                 break
-            start += max_results
+
+    def get_issue_comments(self, issue_key: str) -> list[dict]:
+        """Fetch comments for a single issue."""
+        data = self.get(f"issue/{issue_key}/comment", {"maxResults": 100})
+        return data.get("comments", [])
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +110,7 @@ def collect_relationships(jira: JiraClient, project_keys: set[str]):
     # Build regex to detect cross-project mentions like "PROJ-123"
     mention_re = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
 
-    fields = "project,issuelinks,parent,subtasks,description,comment"
+    fields = ["project", "issuelinks", "parent", "subtasks", "description"]
     total_issues = 0
 
     for proj_key in sorted(project_keys):
@@ -110,6 +119,7 @@ def collect_relationships(jira: JiraClient, project_keys: set[str]):
 
         for issue in jira.search_issues(jql, fields):
             total_issues += 1
+            issue_key = issue["key"]
             src_proj = issue["fields"]["project"]["key"]
             issue_count_by_project[src_proj] += 1
 
@@ -150,16 +160,18 @@ def collect_relationships(jira: JiraClient, project_keys: set[str]):
                         key = tuple(sorted([src_proj, dst_proj]))
                         edge_weights[key] += 1
 
-            # --- 4. Mentions in comments ---
-            comment_data = issue["fields"].get("comment")
-            if comment_data:
-                for c in comment_data.get("comments") or []:
-                    body = c.get("body", "")
-                    body_text = _adf_to_text(body) if isinstance(body, dict) else str(body)
-                    for match in mention_re.findall(body_text):
-                        dst_proj = match.rsplit("-", 1)[0]
-                        if dst_proj != src_proj and dst_proj in project_keys:
-                            key = tuple(sorted([src_proj, dst_proj]))
+            # --- 4. Mentions in comments (fetched separately) ---
+            try:
+                comments = jira.get_issue_comments(issue_key)
+            except Exception:
+                comments = []
+            for c in comments:
+                body = c.get("body", "")
+                body_text = _adf_to_text(body) if isinstance(body, dict) else str(body)
+                for match in mention_re.findall(body_text):
+                    dst_proj = match.rsplit("-", 1)[0]
+                    if dst_proj != src_proj and dst_proj in project_keys:
+                        key = tuple(sorted([src_proj, dst_proj]))
                             edge_weights[key] += 1
 
     log.info(f"Finished scanning {total_issues} issues across {len(project_keys)} projects.")
