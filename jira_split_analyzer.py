@@ -172,7 +172,7 @@ def collect_relationships(jira: JiraClient, project_keys: set[str]):
                     dst_proj = match.rsplit("-", 1)[0]
                     if dst_proj != src_proj and dst_proj in project_keys:
                         key = tuple(sorted([src_proj, dst_proj]))
-                            edge_weights[key] += 1
+                        edge_weights[key] += 1
 
     log.info(f"Finished scanning {total_issues} issues across {len(project_keys)} projects.")
     return dict(edge_weights), dict(issue_count_by_project)
