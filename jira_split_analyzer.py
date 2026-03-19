@@ -411,41 +411,47 @@ def main():
         os.remove(CHECKPOINT_FILE)
         log.info("Removed checkpoint file — starting fresh.")
 
-    # Load .env file if present (simple key=value parsing)
+    # Load saved defaults from .env if present
     env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    saved = {}
     if os.path.exists(env_file):
         with open(env_file) as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
-                    os.environ.setdefault(k.strip(), v.strip())
+                    saved[k.strip()] = v.strip()
 
-    base_url = os.environ.get("JIRA_URL")
-    email = os.environ.get("JIRA_EMAIL")
-    token = os.environ.get("JIRA_API_TOKEN")
+    # Always prompt, showing saved defaults
+    def prompt(label, key, hide=False):
+        default = saved.get(key, "")
+        if default:
+            display = f"{label} [{default}]: "
+        else:
+            display = f"{label}: "
+        value = input(display).strip()
+        return value if value else default
 
-    # Prompt for anything missing
-    if not base_url:
-        base_url = input("Jira URL (e.g. https://yoursite.atlassian.net): ").strip()
-    if not email:
-        email = input("Jira email: ").strip()
-    if not token:
-        token = input("Jira API token (https://id.atlassian.com/manage-profile/security/api-tokens): ").strip()
+    print("\n— Jira Connection —\n")
+    base_url = prompt("Jira URL (e.g. https://yoursite.atlassian.net)", "JIRA_URL")
+    email = prompt("Jira email", "JIRA_EMAIL")
+    token = prompt("Jira API token", "JIRA_API_TOKEN")
 
     if not all([base_url, email, token]):
         print("All three values are required.")
         sys.exit(1)
 
-    # Offer to save for next time
-    if not os.path.exists(env_file):
-        save = input("Save credentials to .env for next time? (y/n): ").strip().lower()
+    # Save for next time if changed or no .env yet
+    new_vals = {"JIRA_URL": base_url, "JIRA_EMAIL": email, "JIRA_API_TOKEN": token}
+    if new_vals != saved:
+        save = input("\nSave credentials for next time? (y/n): ").strip().lower()
         if save == "y":
             with open(env_file, "w") as f:
                 f.write(f"JIRA_URL={base_url}\n")
                 f.write(f"JIRA_EMAIL={email}\n")
                 f.write(f"JIRA_API_TOKEN={token}\n")
             print(f"Saved to {env_file}")
+    print()
 
     jira = JiraClient(base_url, email, token)
 
