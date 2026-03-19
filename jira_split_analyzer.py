@@ -411,16 +411,41 @@ def main():
         os.remove(CHECKPOINT_FILE)
         log.info("Removed checkpoint file — starting fresh.")
 
+    # Load .env file if present (simple key=value parsing)
+    env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(env_file):
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
+
     base_url = os.environ.get("JIRA_URL")
     email = os.environ.get("JIRA_EMAIL")
     token = os.environ.get("JIRA_API_TOKEN")
 
+    # Prompt for anything missing
+    if not base_url:
+        base_url = input("Jira URL (e.g. https://yoursite.atlassian.net): ").strip()
+    if not email:
+        email = input("Jira email: ").strip()
+    if not token:
+        token = input("Jira API token (https://id.atlassian.com/manage-profile/security/api-tokens): ").strip()
+
     if not all([base_url, email, token]):
-        print("Set these environment variables:")
-        print("  JIRA_URL=https://yoursite.atlassian.net")
-        print("  JIRA_EMAIL=you@example.com")
-        print("  JIRA_API_TOKEN=your-api-token")
+        print("All three values are required.")
         sys.exit(1)
+
+    # Offer to save for next time
+    if not os.path.exists(env_file):
+        save = input("Save credentials to .env for next time? (y/n): ").strip().lower()
+        if save == "y":
+            with open(env_file, "w") as f:
+                f.write(f"JIRA_URL={base_url}\n")
+                f.write(f"JIRA_EMAIL={email}\n")
+                f.write(f"JIRA_API_TOKEN={token}\n")
+            print(f"Saved to {env_file}")
 
     jira = JiraClient(base_url, email, token)
 
