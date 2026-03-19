@@ -18,6 +18,7 @@ Usage:
   python jira_split_analyzer.py
 """
 
+import argparse
 import os
 import re
 import sys
@@ -147,7 +148,7 @@ def _save_checkpoint(
         json.dump(data, f, indent=2)
 
 
-def collect_relationships(jira: JiraClient, project_keys: set[str]):
+def collect_relationships(jira: JiraClient, project_keys: set[str], scan_comments: bool = False):
     """
     Scan all issues and collect cross-project relationships.
     Saves a checkpoint after each project so it can resume if interrupted.
@@ -184,14 +185,14 @@ def collect_relationships(jira: JiraClient, project_keys: set[str]):
         jql = f'project = "{proj_key}" ORDER BY created ASC'
         proj_issues = 0
 
-        for issue in jira.search_issues(jql, fields):
+        for issue in jira.search_issues(jql, fields, max_results=5000):
             total_issues += 1
             proj_issues += 1
             issue_key = issue["key"]
             src_proj = issue["fields"]["project"]["key"]
             issue_count_by_project[src_proj] += 1
 
-            if proj_issues % 500 == 0:
+            if proj_issues % 1000 == 0:
                 log.info(f"  ... {proj_issues} issues in {proj_key} ({total_issues} total)")
 
             # --- 1. Issue links ---
@@ -220,7 +221,6 @@ def collect_relationships(jira: JiraClient, project_keys: set[str]):
             # --- 3. Mentions in description ---
             desc = issue["fields"].get("description")
             if desc:
-                # Jira Cloud v3 returns ADF; convert to plain text for scanning
                 desc_text = _adf_to_text(desc) if isinstance(desc, dict) else str(desc)
                 for match in mention_re.findall(desc_text):
                     dst_proj = match.rsplit("-", 1)[0]
@@ -228,19 +228,20 @@ def collect_relationships(jira: JiraClient, project_keys: set[str]):
                         key = tuple(sorted([src_proj, dst_proj]))
                         edge_weights[key] += 1
 
-            # --- 4. Mentions in comments (fetched separately) ---
-            try:
-                comments = jira.get_issue_comments(issue_key)
-            except Exception:
-                comments = []
-            for c in comments:
-                body = c.get("body", "")
-                body_text = _adf_to_text(body) if isinstance(body, dict) else str(body)
-                for match in mention_re.findall(body_text):
-                    dst_proj = match.rsplit("-", 1)[0]
-                    if dst_proj != src_proj and dst_proj in project_keys:
-                        key = tuple(sorted([src_proj, dst_proj]))
-                        edge_weights[key] += 1
+            # --- 4. Mentions in comments (opt-in, slow) ---
+            if scan_comments:
+                try:
+                    comments = jira.get_issue_comments(issue_key)
+                except Exception:
+                    comments = []
+                for c in comments:
+                    body = c.get("body", "")
+                    body_text = _adf_to_text(body) if isinstance(body, dict) else str(body)
+                    for match in mention_re.findall(body_text):
+                        dst_proj = match.rsplit("-", 1)[0]
+                        if dst_proj != src_proj and dst_proj in project_keys:
+                            key = tuple(sorted([src_proj, dst_proj]))
+                            edge_weights[key] += 1
 
         # Save checkpoint after each project completes
         completed_projects.append(proj_key)
@@ -395,6 +396,21 @@ def print_report(
 # ---------------------------------------------------------------------------
 
 def main():
+    parser = argparse.ArgumentParser(description="Analyze Jira projects for optimal site split")
+    parser.add_argument(
+        "--scan-comments", action="store_true",
+        help="Also scan issue comments for cross-project mentions (much slower)",
+    )
+    parser.add_argument(
+        "--fresh", action="store_true",
+        help="Ignore checkpoint and start a fresh scan",
+    )
+    args = parser.parse_args()
+
+    if args.fresh and os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
+        log.info("Removed checkpoint file — starting fresh.")
+
     base_url = os.environ.get("JIRA_URL")
     email = os.environ.get("JIRA_EMAIL")
     token = os.environ.get("JIRA_API_TOKEN")
@@ -419,7 +435,7 @@ def main():
         sys.exit(0)
 
     # Collect relationships
-    edge_weights, issue_counts = collect_relationships(jira, project_keys)
+    edge_weights, issue_counts = collect_relationships(jira, project_keys, scan_comments=args.scan_comments)
 
     if not edge_weights:
         print("No cross-project relationships found. Any split works equally well.")
