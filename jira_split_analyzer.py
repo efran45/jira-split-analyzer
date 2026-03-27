@@ -60,6 +60,15 @@ class JiraClient:
             resp.raise_for_status()
         return resp.json()
 
+    def get_project_roles(self, project_key: str) -> dict:
+        """Return {role_name: role_url} for a project."""
+        return self.get(f"project/{project_key}/role")
+
+    def get_role_actors(self, project_key: str, role_id: str) -> list[dict]:
+        """Return the list of actors (users/groups) for a specific project role."""
+        data = self.get(f"project/{project_key}/role/{role_id}")
+        return data.get("actors", [])
+
     def get_all_projects(self) -> list[dict]:
         """Return all projects the user can see."""
         projects = []
@@ -266,6 +275,188 @@ def _adf_to_text(node) -> str:
 
 
 # ---------------------------------------------------------------------------
+# User / permission analysis
+# ---------------------------------------------------------------------------
+
+def collect_user_project_roles(jira: JiraClient, project_keys: set[str]) -> dict:
+    """
+    For every project, fetch all role actors (users and groups) via the Jira
+    project-role API.  No data is written to disk; everything stays in memory.
+
+    Returns:
+        {
+            "PROJ_KEY": {
+                "users":  {"accountId1", ...},   # all unique user accountIds
+                "groups": {"groupName1", ...},   # all unique group names
+                "roles":  {
+                    "Developer": {"users": {...}, "groups": {...}},
+                    ...
+                }
+            },
+            ...
+        }
+    """
+    result = {}
+    for proj_key in sorted(project_keys):
+        log.info(f"Fetching roles for {proj_key} …")
+        proj_data: dict = {"users": set(), "groups": set(), "roles": {}}
+
+        try:
+            roles = jira.get_project_roles(proj_key)
+        except Exception as exc:
+            log.warning(f"  Could not fetch roles for {proj_key}: {exc}")
+            result[proj_key] = proj_data
+            continue
+
+        for role_name, role_url in roles.items():
+            role_id = str(role_url).rstrip("/").split("/")[-1]
+            try:
+                actors = jira.get_role_actors(proj_key, role_id)
+            except Exception as exc:
+                log.warning(f"  Could not fetch actors for role '{role_name}' in {proj_key}: {exc}")
+                continue
+
+            role_users: set[str] = set()
+            role_groups: set[str] = set()
+            for actor in actors:
+                if actor.get("type") == "atlassian-user-role-actor":
+                    account_id = (actor.get("actorUser") or {}).get("accountId")
+                    if account_id:
+                        role_users.add(account_id)
+                        proj_data["users"].add(account_id)
+                elif actor.get("type") == "atlassian-group-role-actor":
+                    group_name = (actor.get("actorGroup") or {}).get("name") or actor.get("displayName")
+                    if group_name:
+                        role_groups.add(group_name)
+                        proj_data["groups"].add(group_name)
+
+            proj_data["roles"][role_name] = {"users": role_users, "groups": role_groups}
+
+        result[proj_key] = proj_data
+        log.info(
+            f"  ✓ {proj_key}: {len(proj_data['users'])} users, "
+            f"{len(proj_data['groups'])} groups across {len(roles)} roles"
+        )
+
+    return result
+
+
+def build_user_overlap_edges(user_data: dict) -> dict:
+    """
+    Build edge weights from shared users/groups between every pair of projects.
+    Groups count 3× more than individual users (they represent whole teams).
+
+    Returns: {(projA, projB): overlap_score}  (same tuple-key format as edge_weights)
+    """
+    overlap: dict = defaultdict(int)
+    project_keys = list(user_data.keys())
+    for a, b in combinations(project_keys, 2):
+        shared_users = len(user_data[a]["users"] & user_data[b]["users"])
+        shared_groups = len(user_data[a]["groups"] & user_data[b]["groups"])
+        score = shared_users + shared_groups * 3
+        if score > 0:
+            overlap[tuple(sorted([a, b]))] += score
+    return dict(overlap)
+
+
+def analyze_user_split_impact(
+    site_a: set[str],
+    site_b: set[str],
+    user_data: dict,
+) -> dict:
+    """
+    Classify every user and group as belonging to Site A only, Site B only,
+    or spanning both sites (requires provisioning on both).
+
+    Returns a dict with six sets keyed by descriptive names.
+    """
+    users_a: set[str] = set()
+    users_b: set[str] = set()
+    groups_a: set[str] = set()
+    groups_b: set[str] = set()
+
+    for proj in site_a:
+        if proj in user_data:
+            users_a |= user_data[proj]["users"]
+            groups_a |= user_data[proj]["groups"]
+    for proj in site_b:
+        if proj in user_data:
+            users_b |= user_data[proj]["users"]
+            groups_b |= user_data[proj]["groups"]
+
+    return {
+        "users_site_a_only":  users_a - users_b,
+        "users_site_b_only":  users_b - users_a,
+        "users_on_both":      users_a & users_b,
+        "groups_site_a_only": groups_a - groups_b,
+        "groups_site_b_only": groups_b - groups_a,
+        "groups_on_both":     groups_a & groups_b,
+    }
+
+
+def print_user_report(
+    impact: dict,
+    user_data: dict,
+    site_a: set[str],
+    site_b: set[str],
+):
+    total_users = (
+        len(impact["users_site_a_only"])
+        + len(impact["users_site_b_only"])
+        + len(impact["users_on_both"])
+    )
+    total_groups = (
+        len(impact["groups_site_a_only"])
+        + len(impact["groups_site_b_only"])
+        + len(impact["groups_on_both"])
+    )
+
+    print("\n--- User & Permission Impact ---")
+    print(f"  Total unique users:  {total_users}")
+    print(f"  Total unique groups: {total_groups}")
+    print()
+    print(f"  Users exclusive to Site A:  {len(impact['users_site_a_only'])}")
+    print(f"  Users exclusive to Site B:  {len(impact['users_site_b_only'])}")
+    print(f"  Users spanning BOTH sites:  {len(impact['users_on_both'])}"
+          + ("  ← need accounts on both sites" if impact["users_on_both"] else ""))
+    print()
+    print(f"  Groups exclusive to Site A: {len(impact['groups_site_a_only'])}")
+    print(f"  Groups exclusive to Site B: {len(impact['groups_site_b_only'])}")
+    print(f"  Groups spanning BOTH sites: {len(impact['groups_on_both'])}"
+          + ("  ← must be duplicated" if impact["groups_on_both"] else ""))
+
+    if impact["groups_on_both"]:
+        print("\n  Groups to duplicate across both sites:")
+        for g in sorted(impact["groups_on_both"]):
+            print(f"    - {g}")
+
+    if impact["groups_site_a_only"]:
+        print("\n  Groups staying on Site A only:")
+        for g in sorted(impact["groups_site_a_only"]):
+            print(f"    - {g}")
+
+    if impact["groups_site_b_only"]:
+        print("\n  Groups staying on Site B only:")
+        for g in sorted(impact["groups_site_b_only"]):
+            print(f"    - {g}")
+
+    # Per-project breakdown table
+    print("\n  Per-project user/group counts:")
+    table = []
+    for proj in sorted(site_a | site_b):
+        if proj in user_data:
+            site_label = "A" if proj in site_a else "B"
+            table.append([
+                proj,
+                site_label,
+                len(user_data[proj]["users"]),
+                len(user_data[proj]["groups"]),
+                ", ".join(sorted(user_data[proj]["roles"].keys())),
+            ])
+    print(tabulate(table, headers=["Project", "Site", "Users", "Groups", "Roles"], tablefmt="simple"))
+
+
+# ---------------------------------------------------------------------------
 # Graph analysis
 # ---------------------------------------------------------------------------
 
@@ -405,6 +596,19 @@ def main():
         "--fresh", action="store_true",
         help="Ignore checkpoint and start a fresh scan",
     )
+    parser.add_argument(
+        "--user-weight", type=float, default=10.0, metavar="W",
+        help=(
+            "Scale factor applied to user/group overlap edges before merging "
+            "with issue-link edges (default: 10). Raise to make user affinity "
+            "influence the split more; set to 0 to disable user weighting even "
+            "when --include-users is active."
+        ),
+    )
+    parser.add_argument(
+        "--include-users", action="store_true",
+        help="Fetch project role members and factor user/group overlap into the split",
+    )
     args = parser.parse_args()
 
     if args.fresh and os.path.exists(CHECKPOINT_FILE):
@@ -465,12 +669,37 @@ def main():
         print("Need at least 2 projects to analyze a split.")
         sys.exit(0)
 
-    # Collect relationships
+    # Decide whether to include user/permission analysis
+    include_users = args.include_users
+    if not include_users:
+        ans = input("Include user/permission analysis? (y/n) [y]: ").strip().lower()
+        include_users = ans != "n"
+
+    # Collect issue-link relationships
     edge_weights, issue_counts = collect_relationships(jira, project_keys, scan_comments=args.scan_comments)
 
     if not edge_weights:
         print("No cross-project relationships found. Any split works equally well.")
         sys.exit(0)
+
+    # Optionally collect user/group data and merge into edge weights
+    user_data: dict = {}
+    user_overlap_edges: dict = {}
+    if include_users:
+        log.info("Collecting user and group role assignments …")
+        user_data = collect_user_project_roles(jira, project_keys)
+        user_overlap_edges = build_user_overlap_edges(user_data)
+        if user_overlap_edges and args.user_weight > 0:
+            log.info(
+                f"Merging {len(user_overlap_edges)} user-overlap edges "
+                f"(weight ×{args.user_weight}) into the graph …"
+            )
+            merged: dict = dict(edge_weights)
+            for key, score in user_overlap_edges.items():
+                merged[key] = merged.get(key, 0) + score * args.user_weight
+            edge_weights = merged
+        else:
+            log.info("No user/group overlap found between projects.")
 
     # Build graph & analyze
     G = build_graph(project_keys, edge_weights, issue_counts)
@@ -480,8 +709,21 @@ def main():
     # Report
     print_report(G, edge_weights, issue_counts, communities, site_a, site_b, cut_weight)
 
+    # User impact report (appended to main report)
+    user_impact: dict = {}
+    if include_users and user_data:
+        user_impact = analyze_user_split_impact(site_a, site_b, user_data)
+        print_user_report(user_impact, user_data, site_a, site_b)
+        print("\n" + "=" * 70)
+
     # Export raw data
-    output = {
+    def _set_to_list(obj):
+        """JSON-serialise sets as sorted lists."""
+        if isinstance(obj, set):
+            return sorted(obj)
+        raise TypeError(f"Object of type {type(obj)} is not JSON serialisable")
+
+    output: dict = {
         "edge_weights": {f"{a}|{b}": w for (a, b), w in edge_weights.items()},
         "issue_counts": issue_counts,
         "communities": communities,
@@ -491,6 +733,31 @@ def main():
             "cut_weight": cut_weight,
         },
     }
+    if user_impact:
+        output["user_permission_impact"] = {
+            "users_site_a_only":  sorted(user_impact["users_site_a_only"]),
+            "users_site_b_only":  sorted(user_impact["users_site_b_only"]),
+            "users_on_both":      sorted(user_impact["users_on_both"]),
+            "groups_site_a_only": sorted(user_impact["groups_site_a_only"]),
+            "groups_site_b_only": sorted(user_impact["groups_site_b_only"]),
+            "groups_on_both":     sorted(user_impact["groups_on_both"]),
+        }
+    if user_data:
+        output["project_roles"] = {
+            proj: {
+                "users":  sorted(data["users"]),
+                "groups": sorted(data["groups"]),
+                "roles": {
+                    role: {
+                        "users":  sorted(actors["users"]),
+                        "groups": sorted(actors["groups"]),
+                    }
+                    for role, actors in data["roles"].items()
+                },
+            }
+            for proj, data in user_data.items()
+        }
+
     with open("jira_split_results.json", "w") as f:
         json.dump(output, f, indent=2)
     log.info("Raw data saved to jira_split_results.json")
