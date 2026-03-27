@@ -2,3 +2,6 @@ requests
 networkx
 python-louvain
 tabulate
+streamlit
+plotly
+pandas
