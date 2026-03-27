@@ -70,7 +70,13 @@ class JiraClient:
         return data.get("actors", [])
 
     def get_all_projects(self) -> list[dict]:
-        """Return all projects the user can see."""
+        """
+        Return all projects the user can see.
+
+        Tries the paginated /project/search endpoint first (requires Browse
+        Projects permission).  If that returns nothing, falls back to the older
+        /project endpoint which is more permissive and returns a plain list.
+        """
         projects = []
         start = 0
         while True:
@@ -79,6 +85,14 @@ class JiraClient:
             if data["isLast"]:
                 break
             start += len(data["values"])
+
+        if not projects:
+            log.info("project/search returned 0 results — trying legacy /project endpoint …")
+            result = self.get("project")
+            # Legacy endpoint returns a plain list, not a paginated envelope
+            if isinstance(result, list):
+                projects = result
+
         return projects
 
     def search_issues(self, jql: str, fields: list[str], max_results: int = 100):
