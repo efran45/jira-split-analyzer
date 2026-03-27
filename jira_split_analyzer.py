@@ -673,6 +673,18 @@ def main():
 
     jira = JiraClient(base_url, email, token)
 
+    # Verify connectivity and show which account is being used
+    try:
+        myself = jira.get("myself")
+        log.info(
+            f"Authenticated as: {myself.get('displayName')} "
+            f"<{myself.get('emailAddress')}> (accountId: {myself.get('accountId')})"
+        )
+    except Exception as exc:
+        print(f"\nAuthentication failed: {exc}")
+        print("Check your Jira URL, email, and API token.")
+        sys.exit(1)
+
     # Discover projects
     log.info("Fetching projects ...")
     projects = jira.get_all_projects()
