@@ -727,25 +727,35 @@ def score_partition(
     user_data: dict,
     project_categories: dict,
     raw_edge_weights: dict,
+    min_site_fraction: float = 0.15,
 ) -> dict:
     """
-    Evaluate a partition against all three objectives in priority order:
+    Evaluate a partition against all objectives in priority order:
 
-      1. User disruption  — users who must log into 2+ sites  (highest priority)
-      2. Categories split — categories whose projects span multiple sites
-      3. Cross-site links — sum of raw issue-link weights crossing sites
+      0. Balance         — every site must hold >= min_site_fraction of projects
+                           (treated as a near-hard constraint via huge penalty)
+      1. User disruption — users who must log into 2+ sites
+      2. Categories split— categories whose projects span multiple sites
+      3. Cross-site links— sum of raw issue-link weights crossing sites
 
     Returns a dict with each metric plus a composite score (lower = better).
-    The composite uses lexicographic-style weighting so objective 1 always
-    dominates objective 2, which always dominates objective 3.
     """
     n = len(sites)
+    non_empty = [s for s in sites if s]
+    total_projects = sum(len(s) for s in non_empty)
 
     def site_idx(proj: str) -> int:
         for i, s in enumerate(sites):
             if proj in s:
                 return i
         return -1
+
+    # 0. Balance — hard-ish constraint
+    min_size    = min(len(s) for s in non_empty) if non_empty else 0
+    min_frac    = min_size / total_projects if total_projects else 0
+    balance_ok  = min_frac >= min_site_fraction
+    # How far below the threshold (0 when satisfied)
+    balance_violation = max(0.0, min_site_fraction - min_frac)
 
     # 1. User disruption
     ud = user_disruption_score(sites, user_data)
@@ -765,20 +775,22 @@ def score_partition(
         if site_idx(a) != site_idx(b) and site_idx(a) >= 0 and site_idx(b) >= 0
     ))
 
-    # Composite — objective 1 always overrides 2, objective 2 always overrides 3
     max_links = sum(raw_edge_weights.values()) or 1
     composite = (
-        ud        * 1_000_000
-        + cats_split * 1_000
+        balance_violation * 10_000_000_000   # overwhelms everything when violated
+        + ud              * 1_000_000
+        + cats_split      * 1_000
         + (cross_links / max_links) * 100
     )
 
     return {
-        "user_disruption":  ud,
-        "categories_split": cats_split,
-        "cross_site_links": cross_links,
-        "composite":        composite,
-        "n_sites":          n,
+        "user_disruption":    ud,
+        "categories_split":   cats_split,
+        "cross_site_links":   cross_links,
+        "balance_ok":         balance_ok,
+        "smallest_site_pct":  round(min_frac * 100, 1),
+        "composite":          composite,
+        "n_sites":            n,
     }
 
 
@@ -827,15 +839,21 @@ def _category_first_partition(
 def local_search_improve(
     initial_sites: list[set],
     score_fn,
+    min_site_fraction: float = 0.15,
     max_moves: int = 500,
 ) -> tuple[list[set], dict]:
     """
     Greedy local search: repeatedly move one project to a different site if
     it strictly improves the composite score.  Stops when no improving move
     exists or max_moves is reached.
+
+    Moves that would push any site below min_site_fraction are skipped
+    before the score function is even called, for efficiency.
     """
     sites = [set(s) for s in initial_sites]
     current = score_fn(sites)
+    total = sum(len(s) for s in sites)
+    min_size = max(1, int(total * min_site_fraction))
     moves = 0
 
     while moves < max_moves:
@@ -843,14 +861,14 @@ def local_search_improve(
         best_delta_score = None
 
         for from_i, site in enumerate(sites):
+            if len(site) <= min_size:        # moving from here would violate balance
+                continue
             for proj in list(site):
                 for to_i in range(len(sites)):
                     if to_i == from_i:
                         continue
                     candidate = [set(s) for s in sites]
                     candidate[from_i].discard(proj)
-                    if not candidate[from_i]:   # never empty a site
-                        continue
                     candidate[to_i].add(proj)
                     sc = score_fn(candidate)
                     if sc["composite"] < current["composite"]:
@@ -874,18 +892,19 @@ def find_optimal_split(
     project_categories: dict,
     raw_edge_weights: dict,
     max_sites: int = 3,
+    min_site_fraction: float = 0.15,
 ) -> tuple[list[set], dict, str]:
     """
     Try every viable initial partitioning strategy, apply local search to
     each, and return the partition that best satisfies — in strict priority
-    order — user disruption, category cohesion, and cross-site link count.
+    order — balance, user disruption, category cohesion, and cross-site links.
 
     Returns (sites, score_dict, winning_strategy_name).
     """
     project_keys = set(G.nodes())
 
     def score_fn(s):
-        return score_partition(s, user_data, project_categories, raw_edge_weights)
+        return score_partition(s, user_data, project_categories, raw_edge_weights, min_site_fraction)
 
     candidates: list[tuple[list[set], str]] = []
 
@@ -954,7 +973,7 @@ def find_optimal_split(
     best_name = ""
 
     for initial, name in candidates:
-        improved, sc = local_search_improve(initial, score_fn)
+        improved, sc = local_search_improve(initial, score_fn, min_site_fraction)
         log.info(
             f"  [{name}] disruption={sc['user_disruption']}  "
             f"cats_split={sc['categories_split']}  "
@@ -1084,6 +1103,14 @@ def main():
         help="Maximum number of sites to consider (default: 3). "
              "The tool still recommends 2 unless 3 clearly reduces user disruption.",
     )
+    parser.add_argument(
+        "--min-site-fraction", type=float, default=0.15, metavar="F",
+        help=(
+            "Minimum fraction of projects each site must hold (default: 0.15 = 15%%). "
+            "Splits that violate this are heavily penalised. "
+            "E.g. for 100 projects, 0.15 means no site can have fewer than 15 projects."
+        ),
+    )
     args = parser.parse_args()
 
     if args.fresh and os.path.exists(CHECKPOINT_FILE):
@@ -1200,7 +1227,9 @@ def main():
     # Find the globally optimal split across all strategies
     log.info("Evaluating partitioning strategies …")
     recommended_sites, best_score, winning_strategy = find_optimal_split(
-        G, user_data, project_categories, raw_edge_weights, max_sites=args.max_sites
+        G, user_data, project_categories, raw_edge_weights,
+        max_sites=args.max_sites,
+        min_site_fraction=args.min_site_fraction,
     )
     recommended_label = f"{len(recommended_sites)}-way"
     cut_weight = best_score["cross_site_links"]

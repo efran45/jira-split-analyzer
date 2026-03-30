@@ -219,6 +219,13 @@ with st.sidebar:
         "Category affinity weight", 0.0, 500.0, 100.0, 10.0,
         help="How strongly to keep same-category projects on the same site",
     )
+    min_site_pct = st.slider(
+        "Minimum site size (%)", 5, 45, 15, 5,
+        help=(
+            "Each site must hold at least this percentage of projects. "
+            "Raise it to force a more even split."
+        ),
+    )
     allow_three_sites = st.checkbox(
         "Allow 3-site split if it reduces user disruption", value=True,
     )
@@ -338,7 +345,9 @@ if run_button:
             st.write("Evaluating partitioning strategies…")
             max_sites = 3 if allow_three_sites else 2
             recommended_sites, best_score, winning_strategy = find_optimal_split(
-                G, user_data, project_categories, raw_edge_weights, max_sites=max_sites
+                G, user_data, project_categories, raw_edge_weights,
+                max_sites=max_sites,
+                min_site_fraction=min_site_pct / 100,
             )
             recommended_label = f"{len(recommended_sites)}-site"
             st.write(
@@ -409,19 +418,25 @@ pct_preserved = (1 - cut_weight / total_links) * 100 if total_links else 100.0
 # ── Scorecard ────────────────────────────────────────────────────────────────
 st.subheader(f"Recommended: {recommended_label} split  ·  Strategy: _{winning_strategy}_")
 
-c1, c2, c3, c4, c5, c6 = st.columns(6)
+balance_flag = "✅" if best_score.get("balance_ok", True) else "⚠️"
+site_sizes   = [len(s) for s in recommended_sites]
+
+c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
 c1.metric("Projects",              len(project_keys))
 c2.metric("Total Issues",          f"{sum(issue_counts.values()):,}")
-c3.metric("🔴 Users Spanning Sites",
+c3.metric(f"{balance_flag} Smallest Site",
+          f"{best_score.get('smallest_site_pct', 0):.0f}%",
+          help="Balance — smallest site as % of total projects")
+c4.metric("🔴 Users Spanning Sites",
           best_score["user_disruption"],
           help="Priority 1 — users who must log into more than one site")
-c4.metric("🟡 Categories Split",
+c5.metric("🟡 Categories Split",
           best_score["categories_split"],
           help="Priority 2 — project categories (departments) broken across sites")
-c5.metric("🟢 Cross-site Links",
+c6.metric("🟢 Cross-site Links",
           f"{cut_weight:,}",
           help="Priority 3 — issue links that would cross site boundaries")
-c6.metric("Links Preserved",       f"{pct_preserved:.1f}%")
+c7.metric("Links Preserved",       f"{pct_preserved:.1f}%")
 
 st.divider()
 
