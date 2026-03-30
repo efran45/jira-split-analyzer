@@ -78,7 +78,7 @@ def save_env(url: str, email: str, token: str):
         f.write(f"JIRA_API_TOKEN={token}\n")
 
 
-def build_plotly_graph(G: nx.Graph, site_a: set, site_b: set) -> go.Figure:
+def build_plotly_graph(G: nx.Graph, site_a: set, site_b: set, categories: dict | None = None) -> go.Figure:
     pos = nx.spring_layout(G, weight="weight", seed=42)
     max_issues = max((G.nodes[n].get("issues", 0) for n in G.nodes()), default=1) or 1
 
@@ -105,7 +105,9 @@ def build_plotly_graph(G: nx.Graph, site_a: set, site_b: set) -> go.Figure:
         labels.append(node)
         issues = G.nodes[node].get("issues", 0)
         site = "A" if node in site_a else "B"
-        hover.append(f"<b>{node}</b><br>Site {site}<br>{issues:,} issues")
+        cat = (categories or {}).get(node, "")
+        cat_line = f"<br>{cat}" if cat else ""
+        hover.append(f"<b>{node}</b>{cat_line}<br>Site {site}<br>{issues:,} issues")
         colors.append("#2196F3" if node in site_a else "#FF9800")
         sizes.append(14 + 26 * (issues / max_issues))
 
@@ -257,6 +259,10 @@ if run_button:
             # Projects
             projects = jira.get_all_projects()
             project_keys = {p["key"] for p in projects}
+            project_categories = {
+                p["key"]: (p.get("projectCategory") or {}).get("name", "")
+                for p in projects
+            }
 
             # Apply exclusions if the user selected any
             _excluded = st.session_state.get("excluded_projects") or []
@@ -311,6 +317,7 @@ if run_button:
                 "user_data": user_data,
                 "user_impact": user_impact,
                 "project_keys": project_keys,
+                "project_categories": project_categories,
             }
             status.update(label="Analysis complete!", state="complete", expanded=False)
 
@@ -339,9 +346,10 @@ communities    = results["communities"]
 site_a         = results["site_a"]
 site_b         = results["site_b"]
 cut_weight     = results["cut_weight"]
-user_data      = results["user_data"]
-user_impact    = results["user_impact"]
-project_keys   = results["project_keys"]
+user_data          = results["user_data"]
+user_impact        = results["user_impact"]
+project_keys       = results["project_keys"]
+project_categories = results.get("project_categories", {})
 
 total_links    = sum(edge_weights.values())
 pct_preserved  = (1 - cut_weight / total_links) * 100 if total_links else 100.0
@@ -370,17 +378,25 @@ with tabs[0]:
         issues_a = sum(issue_counts.get(p, 0) for p in site_a)
         st.markdown(f"**🔵 Site A** — {len(site_a)} projects, {issues_a:,} issues")
         for p in sorted(site_a):
-            st.markdown(f"- `{p}` &nbsp; {issue_counts.get(p, 0):,} issues")
+            cat = project_categories.get(p, "")
+            cat_str = f" &nbsp;·&nbsp; _{cat}_" if cat else ""
+            st.markdown(f"- `{p}`{cat_str} &nbsp; {issue_counts.get(p, 0):,} issues")
     with col_b:
         issues_b = sum(issue_counts.get(p, 0) for p in site_b)
         st.markdown(f"**🟠 Site B** — {len(site_b)} projects, {issues_b:,} issues")
         for p in sorted(site_b):
-            st.markdown(f"- `{p}` &nbsp; {issue_counts.get(p, 0):,} issues")
+            cat = project_categories.get(p, "")
+            cat_str = f" &nbsp;·&nbsp; _{cat}_" if cat else ""
+            st.markdown(f"- `{p}`{cat_str} &nbsp; {issue_counts.get(p, 0):,} issues")
 
-    st.plotly_chart(build_plotly_graph(G, site_a, site_b), use_container_width=True)
+    st.plotly_chart(build_plotly_graph(G, site_a, site_b, project_categories), use_container_width=True)
 
     broken = [
-        {"Project A": a, "Project B": b, "Links": w}
+        {
+            "Project A": a, "Category A": project_categories.get(a, ""),
+            "Project B": b, "Category B": project_categories.get(b, ""),
+            "Links": w,
+        }
         for (a, b), w in sorted(edge_weights.items(), key=lambda x: -x[1])
         if (a in site_a and b in site_b) or (a in site_b and b in site_a)
     ]
@@ -394,9 +410,14 @@ with tabs[0]:
 with tabs[1]:
     st.subheader("Top 20 Cross-Project Relationships")
     top = sorted(edge_weights.items(), key=lambda x: -x[1])[:20]
-    df_top = pd.DataFrame(
-        [{"Project A": a, "Project B": b, "Links": w} for (a, b), w in top]
-    )
+    df_top = pd.DataFrame([
+        {
+            "Project A": a, "Category A": project_categories.get(a, ""),
+            "Project B": b, "Category B": project_categories.get(b, ""),
+            "Links": w,
+        }
+        for (a, b), w in top
+    ])
     st.dataframe(df_top, use_container_width=True, hide_index=True)
 
 # ── Tab 3: Communities ────────────────────────────────────────────────────────
@@ -409,7 +430,9 @@ with tabs[2]:
         issues = sum(issue_counts.get(p, 0) for p in members)
         with st.expander(f"Cluster {cid} — {len(members)} projects, {issues:,} issues"):
             for m in sorted(members):
-                st.markdown(f"- `{m}` &nbsp; {issue_counts.get(m, 0):,} issues")
+                cat = project_categories.get(m, "")
+                cat_str = f" &nbsp;·&nbsp; _{cat}_" if cat else ""
+                st.markdown(f"- `{m}`{cat_str} &nbsp; {issue_counts.get(m, 0):,} issues")
 
 # ── Tab 4: User & permission impact ──────────────────────────────────────────
 if user_impact:
@@ -455,6 +478,7 @@ if user_impact:
         rows = [
             {
                 "Project": proj,
+                "Category": project_categories.get(proj, ""),
                 "Site": "A" if proj in site_a else "B",
                 "Users": len(user_data[proj]["users"]),
                 "Groups": len(user_data[proj]["groups"]),
