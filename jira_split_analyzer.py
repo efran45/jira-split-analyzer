@@ -148,7 +148,8 @@ def _load_checkpoint() -> dict:
             data = json.load(f)
         log.info(
             f"Loaded checkpoint: {len(data.get('completed_projects', []))} projects "
-            f"already scanned ({data.get('total_issues', 0)} issues)"
+            f"already scanned ({data.get('total_issues', 0)} issues), "
+            f"{len(data.get('roles_completed_projects', []))} projects with roles cached"
         )
         return data
     return {}
@@ -160,15 +161,47 @@ def _save_checkpoint(
     issue_counts: dict,
     total_issues: int,
 ):
-    """Save current progress to disk."""
+    """Save issue-relationship progress to disk, preserving any cached role data."""
+    # Preserve user role fields written by _update_checkpoint_roles
+    existing: dict = {}
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE) as f:
+            existing = json.load(f)
+
     data = {
         "completed_projects": completed_projects,
         "edge_weights": {f"{a}|{b}": w for (a, b), w in edge_weights.items()},
         "issue_counts": issue_counts,
         "total_issues": total_issues,
+        "user_roles": existing.get("user_roles", {}),
+        "roles_completed_projects": existing.get("roles_completed_projects", []),
     }
     with open(CHECKPOINT_FILE, "w") as f:
         json.dump(data, f, indent=2)
+
+
+def _update_checkpoint_roles(proj_key: str, proj_data: dict, roles_completed: list[str]):
+    """Merge user role data for one project into the checkpoint file."""
+    existing: dict = {}
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE) as f:
+            existing = json.load(f)
+
+    existing.setdefault("user_roles", {})[proj_key] = {
+        "users": sorted(proj_data["users"]),
+        "groups": sorted(proj_data["groups"]),
+        "roles": {
+            role: {
+                "users":  sorted(actors["users"]),
+                "groups": sorted(actors["groups"]),
+            }
+            for role, actors in proj_data["roles"].items()
+        },
+    }
+    existing["roles_completed_projects"] = roles_completed
+
+    with open(CHECKPOINT_FILE, "w") as f:
+        json.dump(existing, f, indent=2)
 
 
 def collect_relationships(jira: JiraClient, project_keys: set[str], scan_comments: bool = False):
@@ -295,7 +328,8 @@ def _adf_to_text(node) -> str:
 def collect_user_project_roles(jira: JiraClient, project_keys: set[str]) -> dict:
     """
     For every project, fetch all role actors (users and groups) via the Jira
-    project-role API.  No data is written to disk; everything stays in memory.
+    project-role API.  Results are checkpointed after each project so the
+    fetch can resume if interrupted.
 
     Returns:
         {
@@ -310,8 +344,33 @@ def collect_user_project_roles(jira: JiraClient, project_keys: set[str]) -> dict
             ...
         }
     """
-    result = {}
-    for proj_key in sorted(project_keys):
+    result: dict = {}
+
+    # Restore already-cached role data from the checkpoint
+    checkpoint = _load_checkpoint()
+    roles_completed: list[str] = checkpoint.get("roles_completed_projects", [])
+    for proj_key, saved in checkpoint.get("user_roles", {}).items():
+        if proj_key in project_keys:
+            result[proj_key] = {
+                "users":  set(saved["users"]),
+                "groups": set(saved["groups"]),
+                "roles": {
+                    role: {
+                        "users":  set(a["users"]),
+                        "groups": set(a["groups"]),
+                    }
+                    for role, a in saved.get("roles", {}).items()
+                },
+            }
+
+    remaining = sorted(project_keys - set(roles_completed))
+    if roles_completed:
+        log.info(
+            f"Roles checkpoint: {len(roles_completed)} projects already cached, "
+            f"{len(remaining)} remaining."
+        )
+
+    for proj_key in remaining:
         log.info(f"Fetching roles for {proj_key} …")
         proj_data: dict = {"users": set(), "groups": set(), "roles": {}}
 
@@ -320,6 +379,8 @@ def collect_user_project_roles(jira: JiraClient, project_keys: set[str]) -> dict
         except Exception as exc:
             log.warning(f"  Could not fetch roles for {proj_key}: {exc}")
             result[proj_key] = proj_data
+            roles_completed.append(proj_key)
+            _update_checkpoint_roles(proj_key, proj_data, roles_completed)
             continue
 
         for role_name, role_url in roles.items():
@@ -347,9 +408,11 @@ def collect_user_project_roles(jira: JiraClient, project_keys: set[str]) -> dict
             proj_data["roles"][role_name] = {"users": role_users, "groups": role_groups}
 
         result[proj_key] = proj_data
+        roles_completed.append(proj_key)
+        _update_checkpoint_roles(proj_key, proj_data, roles_completed)
         log.info(
             f"  ✓ {proj_key}: {len(proj_data['users'])} users, "
-            f"{len(proj_data['groups'])} groups across {len(roles)} roles"
+            f"{len(proj_data['groups'])} groups across {len(roles)} roles. Checkpoint saved."
         )
 
     return result
