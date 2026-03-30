@@ -220,6 +220,28 @@ with st.sidebar:
         else:
             excluded_categories = []
 
+        if st.button("🚫 Exclude empty projects", use_container_width=True,
+                     help="Fetches issue counts and auto-excludes any project with 0 issues"):
+            with st.spinner("Checking issue counts…"):
+                try:
+                    _jira2 = JiraClient(jira_url, email, token)
+                    _empty = []
+                    for _key in _all:
+                        _result = _jira2.post("search/jql", {
+                            "jql": f'project = "{_key}"',
+                            "maxResults": 0,
+                            "fields": [],
+                        })
+                        if _result.get("total", 0) == 0:
+                            _empty.append(_key)
+                    # Merge with any already-excluded projects
+                    _merged = sorted(set(st.session_state.get("excluded_projects", [])) | set(_empty))
+                    st.session_state["excluded_projects"] = _merged
+                    st.success(f"Added {len(_empty)} empty project(s) to exclusions.")
+                    st.rerun()
+                except Exception as _exc:
+                    st.error(f"Could not fetch issue counts: {_exc}")
+
         _excl_total = len(excluded_projects) + len(excluded_categories)
         if _excl_total:
             parts = []
