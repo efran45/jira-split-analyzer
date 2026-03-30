@@ -26,9 +26,8 @@ from jira_split_analyzer import (
     build_user_overlap_edges,
     collect_relationships,
     collect_user_project_roles,
-    find_best_bisection,
-    find_best_tripartition,
-    user_disruption_score,
+    find_optimal_split,
+    score_partition,
 )
 
 # ---------------------------------------------------------------------------
@@ -318,47 +317,36 @@ if run_button:
             if include_users:
                 user_data = collect_user_project_roles(jira, project_keys)
                 user_overlap = build_user_overlap_edges(user_data)
-                if user_overlap and user_weight > 0:
-                    for key, score in user_overlap.items():
-                        edge_weights[key] = edge_weights.get(key, 0) + score * user_weight
 
-            # Category affinity edges
+            # Keep raw issue-link weights separate — used for objective scoring
+            raw_edge_weights: dict = dict(edge_weights)
+
+            # Augmented weights guide initial partitioning strategies
+            aug_weights: dict = dict(raw_edge_weights)
+            if include_users and user_overlap and user_weight > 0:
+                for key, sc in user_overlap.items():
+                    aug_weights[key] = aug_weights.get(key, 0) + sc * user_weight
             cat_edges = build_category_affinity_edges(project_categories, project_keys, category_weight)
-            if cat_edges and category_weight > 0:
-                st.write(f"Adding category affinity for {len(cat_edges)} project pairs.")
-                for key, w in cat_edges.items():
-                    edge_weights[key] = edge_weights.get(key, 0) + w
+            for key, w in cat_edges.items():
+                aug_weights[key] = aug_weights.get(key, 0) + w
 
-            # Build graph
-            G = build_graph(project_keys, edge_weights, issue_counts)
+            # Build graph from augmented weights
+            G = build_graph(project_keys, aug_weights, issue_counts)
             communities = analyze_communities(G)
 
-            # 2-way split
-            site_a, site_b, cut_2 = find_best_bisection(G)
-            score_2 = user_disruption_score([site_a, site_b], user_data)
-            st.write(f"2-way split: **{score_2}** users span both sites.")
-
-            # 3-way split (if enabled and enough projects)
-            recommended_sites: list[set] = [site_a, site_b]
-            recommended_label = "2-way"
-            cut_weight = cut_2
-            if allow_three_sites and len(project_keys) >= 3:
-                try:
-                    s_a, s_b, s_c, cut_3 = find_best_tripartition(G)
-                    score_3 = user_disruption_score([s_a, s_b, s_c], user_data)
-                    st.write(f"3-way split: **{score_3}** users span multiple sites.")
-                    if score_3 < score_2:
-                        recommended_sites = [s_a, s_b, s_c]
-                        recommended_label = "3-way"
-                        cut_weight = cut_3
-                        st.success(
-                            f"3-way split recommended — reduces user disruption "
-                            f"from {score_2} → {score_3} users spanning sites."
-                        )
-                    else:
-                        st.info("2-way split is better or equal — recommending 2 sites.")
-                except Exception as exc:
-                    st.warning(f"3-way split failed ({exc}), using 2-way.")
+            # Find globally optimal split
+            st.write("Evaluating partitioning strategies…")
+            max_sites = 3 if allow_three_sites else 2
+            recommended_sites, best_score, winning_strategy = find_optimal_split(
+                G, user_data, project_categories, raw_edge_weights, max_sites=max_sites
+            )
+            recommended_label = f"{len(recommended_sites)}-site"
+            st.write(
+                f"**Winner:** {winning_strategy} — "
+                f"{best_score['user_disruption']} users spanning sites, "
+                f"{best_score['categories_split']} categories split, "
+                f"{best_score['cross_site_links']:,} cross-site links."
+            )
 
             # User disruption impact
             user_impact: dict = {}
@@ -367,12 +355,13 @@ if run_button:
 
             st.session_state["results"] = {
                 "G": G,
-                "edge_weights": edge_weights,
+                "raw_edge_weights": raw_edge_weights,
                 "issue_counts": issue_counts,
                 "communities": communities,
                 "recommended_sites": recommended_sites,
                 "recommended_label": recommended_label,
-                "cut_weight": cut_weight,
+                "best_score": best_score,
+                "winning_strategy": winning_strategy,
                 "user_data": user_data,
                 "user_impact": user_impact,
                 "project_keys": project_keys,
@@ -399,31 +388,40 @@ if not results:
     st.stop()
 
 G                  = results["G"]
-edge_weights       = results["edge_weights"]
+raw_edge_weights   = results["raw_edge_weights"]
 issue_counts       = results["issue_counts"]
 communities        = results["communities"]
 recommended_sites  = results["recommended_sites"]
 recommended_label  = results["recommended_label"]
-cut_weight         = results["cut_weight"]
+best_score         = results["best_score"]
+winning_strategy   = results["winning_strategy"]
 user_data          = results["user_data"]
 user_impact        = results["user_impact"]
 project_keys       = results["project_keys"]
 project_categories = results.get("project_categories", {})
 
-site_labels = [chr(65 + i) for i in range(len(recommended_sites))]  # ["A","B"] or ["A","B","C"]
+site_labels = [chr(65 + i) for i in range(len(recommended_sites))]
+cut_weight  = best_score["cross_site_links"]
 
-total_links    = sum(edge_weights.values())
-pct_preserved  = (1 - cut_weight / total_links) * 100 if total_links else 100.0
-disruption     = user_impact.get("disruption_score", "—") if user_impact else "—"
+total_links   = sum(raw_edge_weights.values())
+pct_preserved = (1 - cut_weight / total_links) * 100 if total_links else 100.0
 
-# Summary metrics
-c1, c2, c3, c4, c5 = st.columns(5)
+# ── Scorecard ────────────────────────────────────────────────────────────────
+st.subheader(f"Recommended: {recommended_label} split  ·  Strategy: _{winning_strategy}_")
+
+c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("Projects",              len(project_keys))
 c2.metric("Total Issues",          f"{sum(issue_counts.values()):,}")
-c3.metric("Cross-project Links",   f"{total_links:,}")
-c4.metric("Links Preserved",       f"{pct_preserved:.1f}%")
-c5.metric("Users Spanning Sites ⚠️", disruption,
-          help="Users who would need to log into more than one site")
+c3.metric("🔴 Users Spanning Sites",
+          best_score["user_disruption"],
+          help="Priority 1 — users who must log into more than one site")
+c4.metric("🟡 Categories Split",
+          best_score["categories_split"],
+          help="Priority 2 — project categories (departments) broken across sites")
+c5.metric("🟢 Cross-site Links",
+          f"{cut_weight:,}",
+          help="Priority 3 — issue links that would cross site boundaries")
+c6.metric("Links Preserved",       f"{pct_preserved:.1f}%")
 
 st.divider()
 
@@ -453,7 +451,6 @@ with tabs[0]:
         use_container_width=True,
     )
 
-    # Cross-site links (only raw issue link weight, not the synthetic affinity weights)
     def site_of(proj):
         for i, s in enumerate(recommended_sites):
             if proj in s:
@@ -463,12 +460,12 @@ with tabs[0]:
     broken = [
         {
             "Project A": a, "Category A": project_categories.get(a, ""),
-            f"Site A": site_labels[site_of(a)] if site_of(a) >= 0 else "?",
+            "Site A": site_labels[site_of(a)] if site_of(a) >= 0 else "?",
             "Project B": b, "Category B": project_categories.get(b, ""),
-            f"Site B": site_labels[site_of(b)] if site_of(b) >= 0 else "?",
+            "Site B": site_labels[site_of(b)] if site_of(b) >= 0 else "?",
             "Links": w,
         }
-        for (a, b), w in sorted(edge_weights.items(), key=lambda x: -x[1])
+        for (a, b), w in sorted(raw_edge_weights.items(), key=lambda x: -x[1])
         if site_of(a) != site_of(b) and site_of(a) >= 0 and site_of(b) >= 0
     ]
     if broken:
@@ -480,7 +477,7 @@ with tabs[0]:
 # ── Tab 2: Top relationships ──────────────────────────────────────────────────
 with tabs[1]:
     st.subheader("Top 20 Cross-Project Relationships")
-    top = sorted(edge_weights.items(), key=lambda x: -x[1])[:20]
+    top = sorted(raw_edge_weights.items(), key=lambda x: -x[1])[:20]
     df_top = pd.DataFrame([
         {
             "Project A": a, "Category A": project_categories.get(a, ""),
@@ -573,18 +570,18 @@ if user_impact:
 st.divider()
 
 export: dict = {
-    "edge_weights": {f"{a}|{b}": w for (a, b), w in edge_weights.items()},
+    "edge_weights": {f"{a}|{b}": w for (a, b), w in raw_edge_weights.items()},
     "issue_counts": issue_counts,
     "communities": communities,
     "project_categories": project_categories,
     "recommended_split": {
-        "type": recommended_label,
-        "cut_weight": cut_weight,
+        "type":             recommended_label,
+        "winning_strategy": winning_strategy,
+        "score":            best_score,
         "sites": {
             lbl: sorted(site)
             for lbl, site in zip(site_labels, recommended_sites)
         },
-        "user_disruption_score": user_impact.get("disruption_score") if user_impact else None,
     },
 }
 if user_impact:

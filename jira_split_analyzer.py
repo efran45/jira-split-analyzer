@@ -719,6 +719,257 @@ def find_best_tripartition(G: nx.Graph) -> tuple[set, set, set, float]:
 
 
 # ---------------------------------------------------------------------------
+# Multi-objective scoring and optimisation
+# ---------------------------------------------------------------------------
+
+def score_partition(
+    sites: list[set],
+    user_data: dict,
+    project_categories: dict,
+    raw_edge_weights: dict,
+) -> dict:
+    """
+    Evaluate a partition against all three objectives in priority order:
+
+      1. User disruption  — users who must log into 2+ sites  (highest priority)
+      2. Categories split — categories whose projects span multiple sites
+      3. Cross-site links — sum of raw issue-link weights crossing sites
+
+    Returns a dict with each metric plus a composite score (lower = better).
+    The composite uses lexicographic-style weighting so objective 1 always
+    dominates objective 2, which always dominates objective 3.
+    """
+    n = len(sites)
+
+    def site_idx(proj: str) -> int:
+        for i, s in enumerate(sites):
+            if proj in s:
+                return i
+        return -1
+
+    # 1. User disruption
+    ud = user_disruption_score(sites, user_data)
+
+    # 2. Categories split across sites
+    cat_site_sets: dict = defaultdict(set)
+    for i, site in enumerate(sites):
+        for proj in site:
+            cat = project_categories.get(proj, "")
+            if cat:
+                cat_site_sets[cat].add(i)
+    cats_split = sum(1 for s in cat_site_sets.values() if len(s) > 1)
+
+    # 3. Raw cross-site issue links
+    cross_links = int(sum(
+        w for (a, b), w in raw_edge_weights.items()
+        if site_idx(a) != site_idx(b) and site_idx(a) >= 0 and site_idx(b) >= 0
+    ))
+
+    # Composite — objective 1 always overrides 2, objective 2 always overrides 3
+    max_links = sum(raw_edge_weights.values()) or 1
+    composite = (
+        ud        * 1_000_000
+        + cats_split * 1_000
+        + (cross_links / max_links) * 100
+    )
+
+    return {
+        "user_disruption":  ud,
+        "categories_split": cats_split,
+        "cross_site_links": cross_links,
+        "composite":        composite,
+        "n_sites":          n,
+    }
+
+
+def _category_first_partition(
+    project_keys: set[str],
+    project_categories: dict,
+    user_data: dict,
+    n_sites: int,
+) -> list[set]:
+    """
+    Greedy category-first bin packing.
+
+    Treats each project category as an atomic unit (never split across sites).
+    Uncategorised projects are treated as individual units.
+    Each unit is assigned to whichever current site minimises user disruption,
+    with project-count balance as a tie-breaker.
+    """
+    by_cat: dict = defaultdict(set)
+    uncategorised: set = set()
+    for proj in project_keys:
+        cat = project_categories.get(proj, "")
+        if cat:
+            by_cat[cat].add(proj)
+        else:
+            uncategorised.add(proj)
+
+    units: list[set] = list(by_cat.values()) + [{p} for p in sorted(uncategorised)]
+    units.sort(key=len, reverse=True)   # largest first for better packing
+
+    sites: list[set] = [set() for _ in range(n_sites)]
+    for unit in units:
+        best_i, best_val = 0, float("inf")
+        for i in range(n_sites):
+            trial = [set(s) for s in sites]
+            trial[i] |= unit
+            ud = user_disruption_score(trial, user_data)
+            balance = max(len(s) for s in trial) - min(len(s) for s in trial)
+            val = ud * 10_000 + balance
+            if val < best_val:
+                best_val, best_i = val, i
+        sites[best_i] |= unit
+
+    return [s for s in sites if s]   # drop any empty sites
+
+
+def local_search_improve(
+    initial_sites: list[set],
+    score_fn,
+    max_moves: int = 500,
+) -> tuple[list[set], dict]:
+    """
+    Greedy local search: repeatedly move one project to a different site if
+    it strictly improves the composite score.  Stops when no improving move
+    exists or max_moves is reached.
+    """
+    sites = [set(s) for s in initial_sites]
+    current = score_fn(sites)
+    moves = 0
+
+    while moves < max_moves:
+        best_delta_sites = None
+        best_delta_score = None
+
+        for from_i, site in enumerate(sites):
+            for proj in list(site):
+                for to_i in range(len(sites)):
+                    if to_i == from_i:
+                        continue
+                    candidate = [set(s) for s in sites]
+                    candidate[from_i].discard(proj)
+                    if not candidate[from_i]:   # never empty a site
+                        continue
+                    candidate[to_i].add(proj)
+                    sc = score_fn(candidate)
+                    if sc["composite"] < current["composite"]:
+                        if best_delta_score is None or sc["composite"] < best_delta_score["composite"]:
+                            best_delta_sites = candidate
+                            best_delta_score = sc
+
+        if best_delta_sites is None:
+            break   # local optimum
+
+        sites = best_delta_sites
+        current = best_delta_score
+        moves += 1
+
+    return sites, current
+
+
+def find_optimal_split(
+    G: nx.Graph,
+    user_data: dict,
+    project_categories: dict,
+    raw_edge_weights: dict,
+    max_sites: int = 3,
+) -> tuple[list[set], dict, str]:
+    """
+    Try every viable initial partitioning strategy, apply local search to
+    each, and return the partition that best satisfies — in strict priority
+    order — user disruption, category cohesion, and cross-site link count.
+
+    Returns (sites, score_dict, winning_strategy_name).
+    """
+    project_keys = set(G.nodes())
+
+    def score_fn(s):
+        return score_partition(s, user_data, project_categories, raw_edge_weights)
+
+    candidates: list[tuple[list[set], str]] = []
+
+    # ── 2-site strategies ────────────────────────────────────────────────────
+    try:
+        a, b, _ = find_best_bisection(G)
+        candidates.append(([a, b], "KL bisection (2-site)"))
+    except Exception:
+        pass
+
+    try:
+        comm = analyze_communities(G)
+        clusters: dict = defaultdict(set)
+        for proj, cid in comm.items():
+            clusters[cid].add(proj)
+        sc = sorted(clusters.values(), key=len, reverse=True)
+        if len(sc) >= 2:
+            candidates.append(([sc[0], set().union(*sc[1:])], "Louvain → 2 sites"))
+    except Exception:
+        pass
+
+    try:
+        cp = _category_first_partition(project_keys, project_categories, user_data, 2)
+        if len(cp) == 2:
+            candidates.append((cp, "Category-first (2-site)"))
+    except Exception:
+        pass
+
+    # ── 3-site strategies ────────────────────────────────────────────────────
+    if max_sites >= 3 and len(project_keys) >= 3:
+        try:
+            a, b, c, _ = find_best_tripartition(G)
+            if c:
+                candidates.append(([a, b, c], "KL bisection (3-site)"))
+        except Exception:
+            pass
+
+        try:
+            comm = analyze_communities(G)
+            clusters = defaultdict(set)
+            for proj, cid in comm.items():
+                clusters[cid].add(proj)
+            sc = sorted(clusters.values(), key=len, reverse=True)
+            if len(sc) >= 3:
+                candidates.append((
+                    [sc[0], sc[1], set().union(*sc[2:])],
+                    "Louvain natural clusters (3-site)",
+                ))
+        except Exception:
+            pass
+
+        try:
+            cp3 = _category_first_partition(project_keys, project_categories, user_data, 3)
+            if len(cp3) == 3:
+                candidates.append((cp3, "Category-first (3-site)"))
+        except Exception:
+            pass
+
+    if not candidates:
+        a, b, _ = find_best_bisection(G)
+        return [a, b], score_fn([a, b]), "KL bisection (fallback)"
+
+    # Apply local search to every candidate and keep the best result
+    best_sites: list[set] | None = None
+    best_score: dict | None = None
+    best_name = ""
+
+    for initial, name in candidates:
+        improved, sc = local_search_improve(initial, score_fn)
+        log.info(
+            f"  [{name}] disruption={sc['user_disruption']}  "
+            f"cats_split={sc['categories_split']}  "
+            f"cross_links={sc['cross_site_links']:,}  "
+            f"composite={sc['composite']:.1f}"
+        )
+        if best_score is None or sc["composite"] < best_score["composite"]:
+            best_sites  = improved
+            best_score  = sc
+            best_name   = name
+
+    return best_sites, best_score, best_name   # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
 
@@ -915,82 +1166,68 @@ def main():
         ans = input("Include user/permission analysis? (y/n) [y]: ").strip().lower()
         include_users = ans != "n"
 
-    # Collect issue-link relationships
-    edge_weights, issue_counts = collect_relationships(jira, project_keys, scan_comments=args.scan_comments)
+    # Collect issue-link relationships (kept separate — used for objective scoring)
+    raw_edge_weights, issue_counts = collect_relationships(
+        jira, project_keys, scan_comments=args.scan_comments
+    )
 
-    if not edge_weights:
+    if not raw_edge_weights:
         print("No cross-project relationships found. Any split works equally well.")
         sys.exit(0)
 
-    # Optionally collect user/group data and merge into edge weights
+    # Build augmented edge weights for graph construction
+    # (user overlap + category affinity guide initial partitioning strategies)
+    aug_edge_weights: dict = dict(raw_edge_weights)
+
+    # Optionally collect user/group data
     user_data: dict = {}
     if include_users:
         log.info("Collecting user and group role assignments …")
         user_data = collect_user_project_roles(jira, project_keys)
         user_overlap_edges = build_user_overlap_edges(user_data)
         if user_overlap_edges and args.user_weight > 0:
-            log.info(
-                f"Merging {len(user_overlap_edges)} user-overlap edges "
-                f"(weight ×{args.user_weight}) into the graph …"
-            )
-            for key, score in user_overlap_edges.items():
-                edge_weights[key] = edge_weights.get(key, 0) + score * args.user_weight
-        else:
-            log.info("No user/group overlap found between projects.")
+            for key, sc in user_overlap_edges.items():
+                aug_edge_weights[key] = aug_edge_weights.get(key, 0) + sc * args.user_weight
 
-    # Merge category affinity edges
     cat_edges = build_category_affinity_edges(project_categories, project_keys, args.category_weight)
-    if cat_edges:
-        log.info(
-            f"Merging {len(cat_edges)} category-affinity edges "
-            f"(weight ×{args.category_weight}) into the graph …"
-        )
-        for key, w in cat_edges.items():
-            edge_weights[key] = edge_weights.get(key, 0) + w
+    for key, w in cat_edges.items():
+        aug_edge_weights[key] = aug_edge_weights.get(key, 0) + w
 
-    # Build graph & analyze
-    G = build_graph(project_keys, edge_weights, issue_counts)
+    # Build graph from augmented weights
+    G = build_graph(project_keys, aug_edge_weights, issue_counts)
     communities = analyze_communities(G)
 
-    # Always compute 2-way split
-    site_a, site_b, cut_2 = find_best_bisection(G)
-    score_2 = user_disruption_score([site_a, site_b], user_data)
-    log.info(f"2-way split: cut={cut_2:,.0f}, users spanning sites={score_2}")
+    # Find the globally optimal split across all strategies
+    log.info("Evaluating partitioning strategies …")
+    recommended_sites, best_score, winning_strategy = find_optimal_split(
+        G, user_data, project_categories, raw_edge_weights, max_sites=args.max_sites
+    )
+    recommended_label = f"{len(recommended_sites)}-way"
+    cut_weight = best_score["cross_site_links"]
 
-    # Optionally try 3-way and compare
-    recommended_sites: list[set] = [site_a, site_b]
-    recommended_label = "2-way"
-    if args.max_sites >= 3 and len(project_keys) >= 3:
-        try:
-            s_a, s_b, s_c, cut_3 = find_best_tripartition(G)
-            score_3 = user_disruption_score([s_a, s_b, s_c], user_data)
-            log.info(f"3-way split: cut={cut_3:,.0f}, users spanning sites={score_3}")
-            if score_3 < score_2:
-                log.info(
-                    f"3-way split reduces user disruption "
-                    f"({score_2} → {score_3} users spanning sites) — recommending 3 sites."
-                )
-                recommended_sites = [s_a, s_b, s_c]
-                recommended_label = "3-way"
-                site_a, site_b = s_a, s_b
-                cut_weight = cut_3
-            else:
-                log.info("2-way split is better or equal — recommending 2 sites.")
-                cut_weight = cut_2
-        except Exception as exc:
-            log.warning(f"3-way split failed: {exc}. Falling back to 2-way.")
-            cut_weight = cut_2
-    else:
-        cut_weight = cut_2
+    log.info(
+        f"Winner: '{winning_strategy}' — "
+        f"disruption={best_score['user_disruption']}  "
+        f"cats_split={best_score['categories_split']}  "
+        f"cross_links={cut_weight:,}"
+    )
 
-    # Report (2-way report for CLI compatibility)
-    print_report(G, edge_weights, issue_counts, communities, recommended_sites[0], recommended_sites[1], cut_weight)
-    if recommended_label == "3-way":
-        print(f"\n  *** 3-WAY SPLIT RECOMMENDED — Site C ({len(recommended_sites[2])} projects):")
+    # Report
+    print_report(
+        G, raw_edge_weights, issue_counts, communities,
+        recommended_sites[0],
+        recommended_sites[1] if len(recommended_sites) > 1 else set(),
+        cut_weight,
+    )
+    print(f"\n  Strategy selected: {winning_strategy}")
+    print(f"  User disruption:   {best_score['user_disruption']} users need 2+ site logins")
+    print(f"  Categories split:  {best_score['categories_split']}")
+    print(f"  Cross-site links:  {cut_weight:,}")
+    if len(recommended_sites) == 3:
+        print(f"\n  *** 3-SITE SPLIT — Site C ({len(recommended_sites[2])} projects):")
         for p in sorted(recommended_sites[2]):
             print(f"    - {p}")
 
-    # User impact report
     if include_users and user_data:
         impact = analyze_user_disruption_multisite(recommended_sites, user_data)
         print(f"\n--- User Disruption: {impact['disruption_score']} users need access to multiple sites ---")
@@ -1006,18 +1243,18 @@ def main():
         raise TypeError(f"Object of type {type(obj)} is not JSON serialisable")
 
     output: dict = {
-        "edge_weights": {f"{a}|{b}": w for (a, b), w in edge_weights.items()},
+        "edge_weights": {f"{a}|{b}": w for (a, b), w in raw_edge_weights.items()},
         "issue_counts": issue_counts,
         "communities": communities,
         "project_categories": project_categories,
         "recommended_split": {
-            "type": recommended_label,
+            "type":             recommended_label,
+            "winning_strategy": winning_strategy,
             "sites": {
                 chr(65 + i): sorted(s)
                 for i, s in enumerate(recommended_sites)
             },
-            "cut_weight": cut_weight,
-            "user_disruption_score": user_disruption_score(recommended_sites, user_data),
+            "score": best_score,
         },
     }
     if include_users and user_data:
