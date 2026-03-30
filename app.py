@@ -230,7 +230,7 @@ with st.sidebar:
                         _result = _jira2.post("search/jql", {
                             "jql": f'project = "{_key}"',
                             "maxResults": 1,
-                            "fields": [],
+                            "fields": ["summary"],
                         })
                         if _result.get("total", 0) == 0:
                             _empty.append(_key)
