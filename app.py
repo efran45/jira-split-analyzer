@@ -173,16 +173,15 @@ with st.sidebar:
 
     if "all_projects" in st.session_state:
         _all = st.session_state["all_projects"]
-        selected_projects = st.multiselect(
-            "Include in analysis",
+        excluded_projects = st.multiselect(
+            "Exclude from analysis",
             options=_all,
-            default=st.session_state.get("selected_projects", _all),
-            help="Deselect projects to exclude them from the analysis",
+            default=st.session_state.get("excluded_projects", []),
+            help="Select any projects to exclude from the analysis",
         )
-        st.session_state["selected_projects"] = selected_projects
-        _excl = len(_all) - len(selected_projects)
-        if _excl:
-            st.caption(f"Excluding {_excl} project(s): {', '.join(sorted(set(_all) - set(selected_projects)))}")
+        st.session_state["excluded_projects"] = excluded_projects
+        if excluded_projects:
+            st.caption(f"Excluding {len(excluded_projects)} project(s): {', '.join(sorted(excluded_projects))}")
     else:
         selected_projects = []
         st.caption("Load projects to choose exclusions, or run directly to include all.")
@@ -259,13 +258,11 @@ if run_button:
             projects = jira.get_all_projects()
             project_keys = {p["key"] for p in projects}
 
-            # Apply exclusions if the user made a selection
-            _selection = st.session_state.get("selected_projects")
-            if _selection is not None:
-                excluded = project_keys - set(_selection)
-                project_keys = project_keys & set(_selection)
-                if excluded:
-                    st.write(f"Excluding {len(excluded)} project(s): {', '.join(sorted(excluded))}")
+            # Apply exclusions if the user selected any
+            _excluded = st.session_state.get("excluded_projects") or []
+            if _excluded:
+                project_keys = project_keys - set(_excluded)
+                st.write(f"Excluding {len(_excluded)} project(s): {', '.join(sorted(_excluded))}")
 
             if len(project_keys) < 2:
                 analysis_error = (
