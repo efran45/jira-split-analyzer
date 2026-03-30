@@ -227,10 +227,9 @@ with st.sidebar:
                     _jira2 = JiraClient(jira_url, email, token)
                     _empty = []
                     for _key in _all:
-                        _result = _jira2.get("search", {
+                        _result = _jira2.post("search/jql", {
                             "jql": f'project = "{_key}"',
                             "maxResults": 1,
-                            "fields": "summary",
                         })
                         if _result.get("total", 0) == 0:
                             _empty.append(_key)
