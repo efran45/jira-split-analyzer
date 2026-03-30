@@ -215,14 +215,20 @@ def collect_relationships(jira: JiraClient, project_keys: set[str], scan_comment
     issue_count_by_project = defaultdict(int)
     completed_projects = []
 
-    # Load checkpoint if available
+    # Load checkpoint if available, filtering to only the requested project_keys
     checkpoint = _load_checkpoint()
     if checkpoint:
-        completed_projects = checkpoint.get("completed_projects", [])
+        completed_projects = [
+            p for p in checkpoint.get("completed_projects", []) if p in project_keys
+        ]
         for k, w in checkpoint.get("edge_weights", {}).items():
             a, b = k.split("|")
-            edge_weights[(a, b)] = w
-        issue_count_by_project.update(checkpoint.get("issue_counts", {}))
+            if a in project_keys and b in project_keys:
+                edge_weights[(a, b)] = w
+        issue_count_by_project.update({
+            k: v for k, v in checkpoint.get("issue_counts", {}).items()
+            if k in project_keys
+        })
 
     # Build regex to detect cross-project mentions like "PROJ-123"
     mention_re = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
@@ -542,7 +548,8 @@ def build_graph(project_keys: set[str], edge_weights: dict, issue_counts: dict) 
     for pk in project_keys:
         G.add_node(pk, issues=issue_counts.get(pk, 0))
     for (a, b), w in edge_weights.items():
-        G.add_edge(a, b, weight=w)
+        if a in project_keys and b in project_keys:
+            G.add_edge(a, b, weight=w)
     return G
 
 
