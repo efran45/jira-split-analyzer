@@ -424,6 +424,30 @@ def collect_user_project_roles(jira: JiraClient, project_keys: set[str]) -> dict
     return result
 
 
+def build_category_affinity_edges(
+    project_categories: dict,
+    project_keys: set[str],
+    weight: float = 100.0,
+) -> dict:
+    """
+    Add affinity edges between every pair of projects that share the same
+    project category.  A high weight strongly encourages the partitioning
+    algorithms to keep same-category projects on the same site.
+
+    Returns: {(projA, projB): weight}
+    """
+    edges: dict = defaultdict(float)
+    by_category: dict = defaultdict(list)
+    for proj, cat in project_categories.items():
+        if proj in project_keys and cat:
+            by_category[cat].append(proj)
+    for members in by_category.values():
+        if len(members) > 1:
+            for a, b in combinations(sorted(members), 2):
+                edges[tuple(sorted([a, b]))] += weight
+    return dict(edges)
+
+
 def build_user_overlap_edges(user_data: dict) -> dict:
     """
     Build edge weights from shared users/groups between every pair of projects.
@@ -440,6 +464,61 @@ def build_user_overlap_edges(user_data: dict) -> dict:
         if score > 0:
             overlap[tuple(sorted([a, b]))] += score
     return dict(overlap)
+
+
+def analyze_user_disruption_multisite(sites: list[set], user_data: dict) -> dict:
+    """
+    Generalised user-impact analysis for any number of sites.
+
+    The primary metric is the number of users who need to log into more
+    than one site — the lower this number, the better the split.
+
+    Returns:
+        {
+            "labels":          ["A", "B", ...],
+            "sites":           [set_a, set_b, ...],
+            "site_users":      [users_on_a, users_on_b, ...],
+            "site_groups":     [groups_on_a, groups_on_b, ...],
+            "spanning_users":  set of users who appear on 2+ sites,
+            "spanning_groups": set of groups that exist on 2+ sites,
+            "disruption_score": len(spanning_users),
+        }
+    """
+    labels = [chr(65 + i) for i in range(len(sites))]  # A, B, C, …
+    site_users: list[set] = []
+    site_groups: list[set] = []
+    for site in sites:
+        users: set = set()
+        groups: set = set()
+        for proj in site:
+            if proj in user_data:
+                users  |= user_data[proj]["users"]
+                groups |= user_data[proj]["groups"]
+        site_users.append(users)
+        site_groups.append(groups)
+
+    all_users  = set().union(*site_users)  if site_users  else set()
+    all_groups = set().union(*site_groups) if site_groups else set()
+
+    spanning_users  = {u for u in all_users  if sum(1 for s in site_users  if u in s) > 1}
+    spanning_groups = {g for g in all_groups if sum(1 for s in site_groups if g in s) > 1}
+
+    return {
+        "labels":           labels,
+        "sites":            sites,
+        "site_users":       site_users,
+        "site_groups":      site_groups,
+        "spanning_users":   spanning_users,
+        "spanning_groups":  spanning_groups,
+        "disruption_score": len(spanning_users),
+    }
+
+
+def user_disruption_score(sites: list[set], user_data: dict) -> int:
+    """Quick helper — returns just the disruption score (users needing 2+ logins)."""
+    if not user_data:
+        return 0
+    return analyze_user_disruption_multisite(sites, user_data)["disruption_score"]
 
 
 def analyze_user_split_impact(
@@ -590,6 +669,55 @@ def compute_cut_weight(G: nx.Graph, set_a: set[str], set_b: set[str]) -> int:
     )
 
 
+def compute_multiway_cut(G: nx.Graph, groups: list[set]) -> float:
+    """Total edge weight crossing any boundary in a k-way partition."""
+    total = 0.0
+    for u, v in G.edges():
+        gu = next((i for i, g in enumerate(groups) if u in g), -1)
+        gv = next((i for i, g in enumerate(groups) if v in g), -1)
+        if gu != gv:
+            total += G[u][v].get("weight", 1)
+    return total
+
+
+def find_best_tripartition(G: nx.Graph) -> tuple[set, set, set, float]:
+    """
+    Find a 3-way split via recursive KL bisection.
+
+    Runs the initial bisection once (A vs BC), then tries splitting each
+    half further and keeps whichever 3-partition has the lower multiway
+    cut weight.
+
+    Returns (site_a, site_b, site_c, cut_weight).
+    Raises ValueError if the graph has fewer than 3 nodes.
+    """
+    if len(G.nodes()) < 3:
+        raise ValueError("Need at least 3 projects for a 3-way split.")
+
+    first, second, _ = find_best_bisection(G)
+    best_groups: list[set] | None = None
+    best_cut = float("inf")
+
+    for keep, to_split in [(first, second), (second, first)]:
+        if len(to_split) < 2:
+            continue
+        sub = G.subgraph(to_split).copy()
+        try:
+            x, y, _ = find_best_bisection(sub)
+        except Exception:
+            continue
+        groups = [keep, x, y]
+        cut = compute_multiway_cut(G, groups)
+        if cut < best_cut:
+            best_cut = cut
+            best_groups = groups
+
+    if best_groups is None:
+        return first, second, set(), compute_multiway_cut(G, [first, second])
+
+    return best_groups[0], best_groups[1], best_groups[2], best_cut
+
+
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
@@ -693,6 +821,18 @@ def main():
         "--include-users", action="store_true",
         help="Fetch project role members and factor user/group overlap into the split",
     )
+    parser.add_argument(
+        "--category-weight", type=float, default=100.0, metavar="W",
+        help=(
+            "Edge weight added between every pair of projects in the same category "
+            "(default: 100). Higher values more strongly keep categories together."
+        ),
+    )
+    parser.add_argument(
+        "--max-sites", type=int, default=3, choices=[2, 3],
+        help="Maximum number of sites to consider (default: 3). "
+             "The tool still recommends 2 unless 3 clearly reduces user disruption.",
+    )
     args = parser.parse_args()
 
     if args.fresh and os.path.exists(CHECKPOINT_FILE):
@@ -755,10 +895,14 @@ def main():
         print("Check your Jira URL, email, and API token.")
         sys.exit(1)
 
-    # Discover projects
+    # Discover projects and their categories
     log.info("Fetching projects ...")
     projects = jira.get_all_projects()
     project_keys = {p["key"] for p in projects}
+    project_categories = {
+        p["key"]: (p.get("projectCategory") or {}).get("name", "")
+        for p in projects
+    }
     log.info(f"Found {len(project_keys)} projects: {', '.join(sorted(project_keys))}")
 
     if len(project_keys) < 2:
@@ -780,7 +924,6 @@ def main():
 
     # Optionally collect user/group data and merge into edge weights
     user_data: dict = {}
-    user_overlap_edges: dict = {}
     if include_users:
         log.info("Collecting user and group role assignments …")
         user_data = collect_user_project_roles(jira, project_keys)
@@ -790,26 +933,69 @@ def main():
                 f"Merging {len(user_overlap_edges)} user-overlap edges "
                 f"(weight ×{args.user_weight}) into the graph …"
             )
-            merged: dict = dict(edge_weights)
             for key, score in user_overlap_edges.items():
-                merged[key] = merged.get(key, 0) + score * args.user_weight
-            edge_weights = merged
+                edge_weights[key] = edge_weights.get(key, 0) + score * args.user_weight
         else:
             log.info("No user/group overlap found between projects.")
+
+    # Merge category affinity edges
+    cat_edges = build_category_affinity_edges(project_categories, project_keys, args.category_weight)
+    if cat_edges:
+        log.info(
+            f"Merging {len(cat_edges)} category-affinity edges "
+            f"(weight ×{args.category_weight}) into the graph …"
+        )
+        for key, w in cat_edges.items():
+            edge_weights[key] = edge_weights.get(key, 0) + w
 
     # Build graph & analyze
     G = build_graph(project_keys, edge_weights, issue_counts)
     communities = analyze_communities(G)
-    site_a, site_b, cut_weight = find_best_bisection(G)
 
-    # Report
-    print_report(G, edge_weights, issue_counts, communities, site_a, site_b, cut_weight)
+    # Always compute 2-way split
+    site_a, site_b, cut_2 = find_best_bisection(G)
+    score_2 = user_disruption_score([site_a, site_b], user_data)
+    log.info(f"2-way split: cut={cut_2:,.0f}, users spanning sites={score_2}")
 
-    # User impact report (appended to main report)
-    user_impact: dict = {}
+    # Optionally try 3-way and compare
+    recommended_sites: list[set] = [site_a, site_b]
+    recommended_label = "2-way"
+    if args.max_sites >= 3 and len(project_keys) >= 3:
+        try:
+            s_a, s_b, s_c, cut_3 = find_best_tripartition(G)
+            score_3 = user_disruption_score([s_a, s_b, s_c], user_data)
+            log.info(f"3-way split: cut={cut_3:,.0f}, users spanning sites={score_3}")
+            if score_3 < score_2:
+                log.info(
+                    f"3-way split reduces user disruption "
+                    f"({score_2} → {score_3} users spanning sites) — recommending 3 sites."
+                )
+                recommended_sites = [s_a, s_b, s_c]
+                recommended_label = "3-way"
+                site_a, site_b = s_a, s_b
+                cut_weight = cut_3
+            else:
+                log.info("2-way split is better or equal — recommending 2 sites.")
+                cut_weight = cut_2
+        except Exception as exc:
+            log.warning(f"3-way split failed: {exc}. Falling back to 2-way.")
+            cut_weight = cut_2
+    else:
+        cut_weight = cut_2
+
+    # Report (2-way report for CLI compatibility)
+    print_report(G, edge_weights, issue_counts, communities, recommended_sites[0], recommended_sites[1], cut_weight)
+    if recommended_label == "3-way":
+        print(f"\n  *** 3-WAY SPLIT RECOMMENDED — Site C ({len(recommended_sites[2])} projects):")
+        for p in sorted(recommended_sites[2]):
+            print(f"    - {p}")
+
+    # User impact report
     if include_users and user_data:
-        user_impact = analyze_user_split_impact(site_a, site_b, user_data)
-        print_user_report(user_impact, user_data, site_a, site_b)
+        impact = analyze_user_disruption_multisite(recommended_sites, user_data)
+        print(f"\n--- User Disruption: {impact['disruption_score']} users need access to multiple sites ---")
+        if impact["spanning_groups"]:
+            print(f"  Groups to duplicate: {', '.join(sorted(impact['spanning_groups']))}")
         print("\n" + "=" * 70)
 
     # Export raw data
@@ -823,20 +1009,30 @@ def main():
         "edge_weights": {f"{a}|{b}": w for (a, b), w in edge_weights.items()},
         "issue_counts": issue_counts,
         "communities": communities,
+        "project_categories": project_categories,
         "recommended_split": {
-            "site_a": sorted(site_a),
-            "site_b": sorted(site_b),
+            "type": recommended_label,
+            "sites": {
+                chr(65 + i): sorted(s)
+                for i, s in enumerate(recommended_sites)
+            },
             "cut_weight": cut_weight,
+            "user_disruption_score": user_disruption_score(recommended_sites, user_data),
         },
     }
-    if user_impact:
+    if include_users and user_data:
+        impact = analyze_user_disruption_multisite(recommended_sites, user_data)
         output["user_permission_impact"] = {
-            "users_site_a_only":  sorted(user_impact["users_site_a_only"]),
-            "users_site_b_only":  sorted(user_impact["users_site_b_only"]),
-            "users_on_both":      sorted(user_impact["users_on_both"]),
-            "groups_site_a_only": sorted(user_impact["groups_site_a_only"]),
-            "groups_site_b_only": sorted(user_impact["groups_site_b_only"]),
-            "groups_on_both":     sorted(user_impact["groups_on_both"]),
+            "disruption_score":  impact["disruption_score"],
+            "spanning_users":    sorted(impact["spanning_users"]),
+            "spanning_groups":   sorted(impact["spanning_groups"]),
+            "per_site": {
+                lbl: {
+                    "users":  sorted(impact["site_users"][i]),
+                    "groups": sorted(impact["site_groups"][i]),
+                }
+                for i, lbl in enumerate(impact["labels"])
+            },
         }
     if user_data:
         output["project_roles"] = {

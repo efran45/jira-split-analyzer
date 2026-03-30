@@ -20,12 +20,15 @@ from jira_split_analyzer import (
     CHECKPOINT_FILE,
     JiraClient,
     analyze_communities,
-    analyze_user_split_impact,
+    analyze_user_disruption_multisite,
+    build_category_affinity_edges,
     build_graph,
     build_user_overlap_edges,
     collect_relationships,
     collect_user_project_roles,
     find_best_bisection,
+    find_best_tripartition,
+    user_disruption_score,
 )
 
 # ---------------------------------------------------------------------------
@@ -78,7 +81,15 @@ def save_env(url: str, email: str, token: str):
         f.write(f"JIRA_API_TOKEN={token}\n")
 
 
-def build_plotly_graph(G: nx.Graph, site_a: set, site_b: set, categories: dict | None = None) -> go.Figure:
+SITE_COLORS = ["#2196F3", "#FF9800", "#4CAF50"]   # blue, orange, green
+SITE_EMOJIS = ["🔵", "🟠", "🟢"]
+
+def build_plotly_graph(
+    G: nx.Graph,
+    sites: list[set],
+    labels: list[str],
+    categories: dict | None = None,
+) -> go.Figure:
     pos = nx.spring_layout(G, weight="weight", seed=42)
     max_issues = max((G.nodes[n].get("issues", 0) for n in G.nodes()), default=1) or 1
 
@@ -97,30 +108,40 @@ def build_plotly_graph(G: nx.Graph, site_a: set, site_b: set, categories: dict |
         hoverinfo="none",
     )
 
-    nx_list, ny_list, labels, hover, colors, sizes = [], [], [], [], [], []
+    node_x_list, node_y_list, node_labels, hover, colors, sizes = [], [], [], [], [], []
+    node_site_idx = {}
+    for i, site in enumerate(sites):
+        for n in site:
+            node_site_idx[n] = i
+
     for node in G.nodes():
         x, y = pos[node]
-        nx_list.append(x)
-        ny_list.append(y)
-        labels.append(node)
+        node_x_list.append(x)
+        node_y_list.append(y)
+        node_labels.append(node)
         issues = G.nodes[node].get("issues", 0)
-        site = "A" if node in site_a else "B"
+        site_idx = node_site_idx.get(node, 0)
+        site_lbl = labels[site_idx] if site_idx < len(labels) else "?"
         cat = (categories or {}).get(node, "")
         cat_line = f"<br>{cat}" if cat else ""
-        hover.append(f"<b>{node}</b>{cat_line}<br>Site {site}<br>{issues:,} issues")
-        colors.append("#2196F3" if node in site_a else "#FF9800")
+        hover.append(f"<b>{node}</b>{cat_line}<br>Site {site_lbl}<br>{issues:,} issues")
+        colors.append(SITE_COLORS[site_idx % len(SITE_COLORS)])
         sizes.append(14 + 26 * (issues / max_issues))
 
     node_trace = go.Scatter(
-        x=nx_list, y=ny_list,
+        x=node_x_list, y=node_y_list,
         mode="markers+text",
-        text=labels,
+        text=node_labels,
         textposition="top center",
         hovertext=hover,
         hoverinfo="text",
         marker=dict(size=sizes, color=colors, line=dict(width=2, color="white")),
     )
 
+    legend_text = "    ".join(
+        f"{SITE_EMOJIS[i % len(SITE_EMOJIS)]} Site {lbl}"
+        for i, lbl in enumerate(labels)
+    )
     fig = go.Figure(
         data=[edge_trace, node_trace],
         layout=go.Layout(
@@ -134,7 +155,7 @@ def build_plotly_graph(G: nx.Graph, site_a: set, site_b: set, categories: dict |
                 dict(
                     x=0, y=1.05, xref="paper", yref="paper",
                     showarrow=False, font=dict(size=13),
-                    text="🔵 Site A    🟠 Site B",
+                    text=legend_text,
                 )
             ],
         ),
@@ -194,6 +215,13 @@ with st.sidebar:
     user_weight = st.slider(
         "User overlap weight", 0.0, 50.0, 10.0, 0.5,
         help="How much shared user/group access influences the split vs issue links",
+    )
+    category_weight = st.slider(
+        "Category affinity weight", 0.0, 500.0, 100.0, 10.0,
+        help="How strongly to keep same-category projects on the same site",
+    )
+    allow_three_sites = st.checkbox(
+        "Allow 3-site split if it reduces user disruption", value=True,
     )
 
     st.subheader("Checkpoint")
@@ -291,28 +319,59 @@ if run_button:
                 user_data = collect_user_project_roles(jira, project_keys)
                 user_overlap = build_user_overlap_edges(user_data)
                 if user_overlap and user_weight > 0:
-                    merged = dict(edge_weights)
                     for key, score in user_overlap.items():
-                        merged[key] = merged.get(key, 0) + score * user_weight
-                    edge_weights = merged
+                        edge_weights[key] = edge_weights.get(key, 0) + score * user_weight
 
-            # Graph + bisection
+            # Category affinity edges
+            cat_edges = build_category_affinity_edges(project_categories, project_keys, category_weight)
+            if cat_edges and category_weight > 0:
+                st.write(f"Adding category affinity for {len(cat_edges)} project pairs.")
+                for key, w in cat_edges.items():
+                    edge_weights[key] = edge_weights.get(key, 0) + w
+
+            # Build graph
             G = build_graph(project_keys, edge_weights, issue_counts)
             communities = analyze_communities(G)
-            site_a, site_b, cut_weight = find_best_bisection(G)
 
-            # User impact
+            # 2-way split
+            site_a, site_b, cut_2 = find_best_bisection(G)
+            score_2 = user_disruption_score([site_a, site_b], user_data)
+            st.write(f"2-way split: **{score_2}** users span both sites.")
+
+            # 3-way split (if enabled and enough projects)
+            recommended_sites: list[set] = [site_a, site_b]
+            recommended_label = "2-way"
+            cut_weight = cut_2
+            if allow_three_sites and len(project_keys) >= 3:
+                try:
+                    s_a, s_b, s_c, cut_3 = find_best_tripartition(G)
+                    score_3 = user_disruption_score([s_a, s_b, s_c], user_data)
+                    st.write(f"3-way split: **{score_3}** users span multiple sites.")
+                    if score_3 < score_2:
+                        recommended_sites = [s_a, s_b, s_c]
+                        recommended_label = "3-way"
+                        cut_weight = cut_3
+                        st.success(
+                            f"3-way split recommended — reduces user disruption "
+                            f"from {score_2} → {score_3} users spanning sites."
+                        )
+                    else:
+                        st.info("2-way split is better or equal — recommending 2 sites.")
+                except Exception as exc:
+                    st.warning(f"3-way split failed ({exc}), using 2-way.")
+
+            # User disruption impact
             user_impact: dict = {}
             if include_users and user_data:
-                user_impact = analyze_user_split_impact(site_a, site_b, user_data)
+                user_impact = analyze_user_disruption_multisite(recommended_sites, user_data)
 
             st.session_state["results"] = {
                 "G": G,
                 "edge_weights": edge_weights,
                 "issue_counts": issue_counts,
                 "communities": communities,
-                "site_a": site_a,
-                "site_b": site_b,
+                "recommended_sites": recommended_sites,
+                "recommended_label": recommended_label,
                 "cut_weight": cut_weight,
                 "user_data": user_data,
                 "user_impact": user_impact,
@@ -339,27 +398,32 @@ results = st.session_state.get("results", {})
 if not results:
     st.stop()
 
-G              = results["G"]
-edge_weights   = results["edge_weights"]
-issue_counts   = results["issue_counts"]
-communities    = results["communities"]
-site_a         = results["site_a"]
-site_b         = results["site_b"]
-cut_weight     = results["cut_weight"]
+G                  = results["G"]
+edge_weights       = results["edge_weights"]
+issue_counts       = results["issue_counts"]
+communities        = results["communities"]
+recommended_sites  = results["recommended_sites"]
+recommended_label  = results["recommended_label"]
+cut_weight         = results["cut_weight"]
 user_data          = results["user_data"]
 user_impact        = results["user_impact"]
 project_keys       = results["project_keys"]
 project_categories = results.get("project_categories", {})
 
+site_labels = [chr(65 + i) for i in range(len(recommended_sites))]  # ["A","B"] or ["A","B","C"]
+
 total_links    = sum(edge_weights.values())
 pct_preserved  = (1 - cut_weight / total_links) * 100 if total_links else 100.0
+disruption     = user_impact.get("disruption_score", "—") if user_impact else "—"
 
 # Summary metrics
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Projects",            len(project_keys))
-c2.metric("Total Issues",        f"{sum(issue_counts.values()):,}")
-c3.metric("Cross-project Links", f"{total_links:,}")
-c4.metric("Links Preserved",     f"{pct_preserved:.1f}%")
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Projects",              len(project_keys))
+c2.metric("Total Issues",          f"{sum(issue_counts.values()):,}")
+c3.metric("Cross-project Links",   f"{total_links:,}")
+c4.metric("Links Preserved",       f"{pct_preserved:.1f}%")
+c5.metric("Users Spanning Sites ⚠️", disruption,
+          help="Users who would need to log into more than one site")
 
 st.divider()
 
@@ -371,34 +435,41 @@ tabs = st.tabs(tab_labels)
 
 # ── Tab 1: Split recommendation ───────────────────────────────────────────────
 with tabs[0]:
-    st.subheader(f"Recommended 2-Way Split  (cut weight: {cut_weight:,})")
+    st.subheader(f"Recommended {recommended_label} Split  (cut weight: {cut_weight:,})")
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        issues_a = sum(issue_counts.get(p, 0) for p in site_a)
-        st.markdown(f"**🔵 Site A** — {len(site_a)} projects, {issues_a:,} issues")
-        for p in sorted(site_a):
-            cat = project_categories.get(p, "")
-            cat_str = f" &nbsp;·&nbsp; _{cat}_" if cat else ""
-            st.markdown(f"- `{p}`{cat_str} &nbsp; {issue_counts.get(p, 0):,} issues")
-    with col_b:
-        issues_b = sum(issue_counts.get(p, 0) for p in site_b)
-        st.markdown(f"**🟠 Site B** — {len(site_b)} projects, {issues_b:,} issues")
-        for p in sorted(site_b):
-            cat = project_categories.get(p, "")
-            cat_str = f" &nbsp;·&nbsp; _{cat}_" if cat else ""
-            st.markdown(f"- `{p}`{cat_str} &nbsp; {issue_counts.get(p, 0):,} issues")
+    cols = st.columns(len(recommended_sites))
+    for i, (site, lbl) in enumerate(zip(recommended_sites, site_labels)):
+        with cols[i]:
+            issues_total = sum(issue_counts.get(p, 0) for p in site)
+            emoji = SITE_EMOJIS[i % len(SITE_EMOJIS)]
+            st.markdown(f"**{emoji} Site {lbl}** — {len(site)} projects, {issues_total:,} issues")
+            for p in sorted(site):
+                cat = project_categories.get(p, "")
+                cat_str = f" &nbsp;·&nbsp; _{cat}_" if cat else ""
+                st.markdown(f"- `{p}`{cat_str} &nbsp; {issue_counts.get(p, 0):,} issues")
 
-    st.plotly_chart(build_plotly_graph(G, site_a, site_b, project_categories), use_container_width=True)
+    st.plotly_chart(
+        build_plotly_graph(G, recommended_sites, site_labels, project_categories),
+        use_container_width=True,
+    )
+
+    # Cross-site links (only raw issue link weight, not the synthetic affinity weights)
+    def site_of(proj):
+        for i, s in enumerate(recommended_sites):
+            if proj in s:
+                return i
+        return -1
 
     broken = [
         {
             "Project A": a, "Category A": project_categories.get(a, ""),
+            f"Site A": site_labels[site_of(a)] if site_of(a) >= 0 else "?",
             "Project B": b, "Category B": project_categories.get(b, ""),
+            f"Site B": site_labels[site_of(b)] if site_of(b) >= 0 else "?",
             "Links": w,
         }
         for (a, b), w in sorted(edge_weights.items(), key=lambda x: -x[1])
-        if (a in site_a and b in site_b) or (a in site_b and b in site_a)
+        if site_of(a) != site_of(b) and site_of(a) >= 0 and site_of(b) >= 0
     ]
     if broken:
         st.subheader(f"Links That Would Cross Sites ({cut_weight:,} total)")
@@ -437,54 +508,60 @@ with tabs[2]:
 # ── Tab 4: User & permission impact ──────────────────────────────────────────
 if user_impact:
     with tabs[3]:
-        total_users = (
-            len(user_impact["users_site_a_only"])
-            + len(user_impact["users_site_b_only"])
-            + len(user_impact["users_on_both"])
-        )
-        total_groups = (
-            len(user_impact["groups_site_a_only"])
-            + len(user_impact["groups_site_b_only"])
-            + len(user_impact["groups_on_both"])
-        )
+        all_site_users  = set().union(*user_impact["site_users"])
+        all_site_groups = set().union(*user_impact["site_groups"])
+        spanning_users  = user_impact["spanning_users"]
+        spanning_groups = user_impact["spanning_groups"]
 
-        m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("Total Users",          total_users)
-        m2.metric("Site A Only",          len(user_impact["users_site_a_only"]))
-        m3.metric("Site B Only",          len(user_impact["users_site_b_only"]))
-        m4.metric("Spanning Both ⚠️",     len(user_impact["users_on_both"]))
-        m5.metric("Total Groups",         total_groups)
-        m6.metric("Groups to Duplicate ⚠️", len(user_impact["groups_on_both"]))
+        # Top metrics
+        metric_cols = st.columns(2 + len(recommended_sites))
+        metric_cols[0].metric("Total Users",            len(all_site_users))
+        metric_cols[1].metric("Users Spanning Sites ⚠️", len(spanning_users))
+        for i, lbl in enumerate(site_labels):
+            exclusive = user_impact["site_users"][i] - spanning_users
+            metric_cols[2 + i].metric(f"Site {lbl} Only", len(exclusive))
 
-        if user_impact["groups_on_both"]:
+        if spanning_users:
             st.warning(
-                f"**{len(user_impact['groups_on_both'])} group(s) span both sites "
-                f"and must be duplicated:**"
+                f"**{len(spanning_users)} user(s) need access to multiple sites** — "
+                f"they must be provisioned on each relevant site."
             )
-            for g in sorted(user_impact["groups_on_both"]):
+
+        if spanning_groups:
+            st.warning(
+                f"**{len(spanning_groups)} group(s) span multiple sites and must be duplicated:**"
+            )
+            for g in sorted(spanning_groups):
                 st.markdown(f"- {g}")
 
-        if user_impact["groups_site_a_only"]:
-            with st.expander(f"Groups staying on Site A ({len(user_impact['groups_site_a_only'])})"):
-                for g in sorted(user_impact["groups_site_a_only"]):
-                    st.markdown(f"- {g}")
+        # Per-site group lists
+        for i, lbl in enumerate(site_labels):
+            exclusive_groups = user_impact["site_groups"][i] - spanning_groups
+            if exclusive_groups:
+                with st.expander(f"Groups exclusive to Site {lbl} ({len(exclusive_groups)})"):
+                    for g in sorted(exclusive_groups):
+                        st.markdown(f"- {g}")
 
-        if user_impact["groups_site_b_only"]:
-            with st.expander(f"Groups staying on Site B ({len(user_impact['groups_site_b_only'])})"):
-                for g in sorted(user_impact["groups_site_b_only"]):
-                    st.markdown(f"- {g}")
-
+        # Per-project breakdown
         st.subheader("Per-Project Breakdown")
+        all_proj = set().union(*recommended_sites)
+
+        def proj_site_label(proj):
+            for i, s in enumerate(recommended_sites):
+                if proj in s:
+                    return site_labels[i]
+            return "?"
+
         rows = [
             {
-                "Project": proj,
+                "Project":  proj,
                 "Category": project_categories.get(proj, ""),
-                "Site": "A" if proj in site_a else "B",
-                "Users": len(user_data[proj]["users"]),
-                "Groups": len(user_data[proj]["groups"]),
-                "Roles": ", ".join(sorted(user_data[proj]["roles"].keys())),
+                "Site":     proj_site_label(proj),
+                "Users":    len(user_data[proj]["users"]),
+                "Groups":   len(user_data[proj]["groups"]),
+                "Roles":    ", ".join(sorted(user_data[proj]["roles"].keys())),
             }
-            for proj in sorted(site_a | site_b)
+            for proj in sorted(all_proj)
             if proj in user_data
         ]
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -499,14 +576,30 @@ export: dict = {
     "edge_weights": {f"{a}|{b}": w for (a, b), w in edge_weights.items()},
     "issue_counts": issue_counts,
     "communities": communities,
+    "project_categories": project_categories,
     "recommended_split": {
-        "site_a": sorted(site_a),
-        "site_b": sorted(site_b),
+        "type": recommended_label,
         "cut_weight": cut_weight,
+        "sites": {
+            lbl: sorted(site)
+            for lbl, site in zip(site_labels, recommended_sites)
+        },
+        "user_disruption_score": user_impact.get("disruption_score") if user_impact else None,
     },
 }
 if user_impact:
-    export["user_permission_impact"] = {k: sorted(v) for k, v in user_impact.items()}
+    export["user_permission_impact"] = {
+        "disruption_score":  user_impact["disruption_score"],
+        "spanning_users":    sorted(user_impact["spanning_users"]),
+        "spanning_groups":   sorted(user_impact["spanning_groups"]),
+        "per_site": {
+            lbl: {
+                "users":  sorted(user_impact["site_users"][i]),
+                "groups": sorted(user_impact["site_groups"][i]),
+            }
+            for i, lbl in enumerate(site_labels)
+        },
+    }
 if user_data:
     export["project_roles"] = {
         proj: {
