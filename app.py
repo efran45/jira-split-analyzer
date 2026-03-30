@@ -190,22 +190,47 @@ with st.sidebar:
                 _jira = JiraClient(jira_url, email, token)
                 _projs = _jira.get_all_projects()
                 st.session_state["all_projects"] = sorted(p["key"] for p in _projs)
+                st.session_state["all_categories"] = sorted({
+                    (p.get("projectCategory") or {}).get("name", "")
+                    for p in _projs
+                    if (p.get("projectCategory") or {}).get("name", "")
+                })
         except Exception as _exc:
             st.error(f"Could not load projects: {_exc}")
 
     if "all_projects" in st.session_state:
         _all = st.session_state["all_projects"]
         excluded_projects = st.multiselect(
-            "Exclude from analysis",
+            "Exclude projects",
             options=_all,
             default=st.session_state.get("excluded_projects", []),
-            help="Select any projects to exclude from the analysis",
+            help="Select individual projects to exclude from the analysis",
         )
         st.session_state["excluded_projects"] = excluded_projects
-        if excluded_projects:
-            st.caption(f"Excluding {len(excluded_projects)} project(s): {', '.join(sorted(excluded_projects))}")
+
+        _all_cats = st.session_state.get("all_categories", [])
+        if _all_cats:
+            excluded_categories = st.multiselect(
+                "Exclude categories",
+                options=_all_cats,
+                default=st.session_state.get("excluded_categories", []),
+                help="Exclude all projects belonging to these categories",
+            )
+            st.session_state["excluded_categories"] = excluded_categories
+        else:
+            excluded_categories = []
+
+        _excl_total = len(excluded_projects) + len(excluded_categories)
+        if _excl_total:
+            parts = []
+            if excluded_projects:
+                parts.append(f"{len(excluded_projects)} project(s)")
+            if excluded_categories:
+                parts.append(f"{len(excluded_categories)} categor{'y' if len(excluded_categories)==1 else 'ies'}")
+            st.caption(f"Excluding {' and '.join(parts)}")
     else:
-        selected_projects = []
+        excluded_projects = []
+        excluded_categories = []
         st.caption("Load projects to choose exclusions, or run directly to include all.")
 
     st.subheader("Analysis Options")
@@ -298,11 +323,23 @@ if run_button:
                 for p in projects
             }
 
-            # Apply exclusions if the user selected any
-            _excluded = st.session_state.get("excluded_projects") or []
-            if _excluded:
-                project_keys = project_keys - set(_excluded)
-                st.write(f"Excluding {len(_excluded)} project(s): {', '.join(sorted(_excluded))}")
+            # Apply project exclusions
+            _excl_projs = set(st.session_state.get("excluded_projects") or [])
+            # Apply category exclusions — remove all projects in excluded categories
+            _excl_cats = set(st.session_state.get("excluded_categories") or [])
+            _excl_by_cat = {
+                p for p, cat in project_categories.items()
+                if cat and cat in _excl_cats
+            }
+            all_excluded = _excl_projs | _excl_by_cat
+            if all_excluded:
+                project_keys = project_keys - all_excluded
+                parts = []
+                if _excl_projs:
+                    parts.append(f"{len(_excl_projs)} project(s)")
+                if _excl_by_cat:
+                    parts.append(f"{len(_excl_by_cat)} project(s) from {len(_excl_cats)} categor{'y' if len(_excl_cats)==1 else 'ies'}")
+                st.write(f"Excluding {' and '.join(parts)}: {', '.join(sorted(all_excluded))}")
 
             if len(project_keys) < 2:
                 analysis_error = (
