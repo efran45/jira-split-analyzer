@@ -50,7 +50,7 @@ class StreamlitLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord):
         self.lines.append(self.format(record))
-        self.container.code("\n".join(self.lines), language=None)
+        self.container.code("\n".join(reversed(self.lines)), language=None)
 
 
 # ---------------------------------------------------------------------------
