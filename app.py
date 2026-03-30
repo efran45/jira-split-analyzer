@@ -160,6 +160,33 @@ with st.sidebar:
     )
     save_creds = st.checkbox("Save credentials to .env", value=bool(saved))
 
+    st.subheader("Projects")
+    credentials_ready = bool(jira_url and email and token)
+    if st.button("🔍 Load Projects", disabled=not credentials_ready, use_container_width=True):
+        try:
+            with st.spinner("Loading…"):
+                _jira = JiraClient(jira_url, email, token)
+                _projs = _jira.get_all_projects()
+                st.session_state["all_projects"] = sorted(p["key"] for p in _projs)
+        except Exception as _exc:
+            st.error(f"Could not load projects: {_exc}")
+
+    if "all_projects" in st.session_state:
+        _all = st.session_state["all_projects"]
+        selected_projects = st.multiselect(
+            "Include in analysis",
+            options=_all,
+            default=st.session_state.get("selected_projects", _all),
+            help="Deselect projects to exclude them from the analysis",
+        )
+        st.session_state["selected_projects"] = selected_projects
+        _excl = len(_all) - len(selected_projects)
+        if _excl:
+            st.caption(f"Excluding {_excl} project(s): {', '.join(sorted(set(_all) - set(selected_projects)))}")
+    else:
+        selected_projects = []
+        st.caption("Load projects to choose exclusions, or run directly to include all.")
+
     st.subheader("Analysis Options")
     scan_comments = st.checkbox("Scan comments (slow)", value=False)
     include_users = st.checkbox("Include user/permission analysis", value=True)
@@ -231,12 +258,21 @@ if run_button:
             # Projects
             projects = jira.get_all_projects()
             project_keys = {p["key"] for p in projects}
+
+            # Apply exclusions if the user made a selection
+            _selection = st.session_state.get("selected_projects")
+            if _selection is not None:
+                excluded = project_keys - set(_selection)
+                project_keys = project_keys & set(_selection)
+                if excluded:
+                    st.write(f"Excluding {len(excluded)} project(s): {', '.join(sorted(excluded))}")
+
             if len(project_keys) < 2:
                 analysis_error = (
-                    f"Found {len(project_keys)} project(s) — need at least 2 to analyze a split."
+                    f"Found {len(project_keys)} project(s) after exclusions — need at least 2 to analyze a split."
                 )
                 raise ValueError(analysis_error)
-            st.write(f"Found **{len(project_keys)}** projects.")
+            st.write(f"Analyzing **{len(project_keys)}** projects.")
 
             # Relationships
             edge_weights, issue_counts = collect_relationships(
